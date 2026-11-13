@@ -8,7 +8,7 @@
    Secrets live in Script Properties (only the owner can read them).
    =================================================================================== */
 
-var GAS_VERSION = '5.1.1';
+var GAS_VERSION = '6.1.0';
 var DEFAULT_MODEL = 'gemini-flash-latest';
 var FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash'];
 var CELL_MAX = 45000;                 // a Sheets cell holds 50,000 characters; keep a margin
@@ -206,11 +206,16 @@ function writeKey_(sh, key, value) {
   sh.getRange(rowIdx, 1, 1, width).setNumberFormat('@').setValues([row]);
 }
 
+/**
+ * Write state under the script lock. `patch` may be a function: it gets the state as it is NOW (inside the lock)
+ * and returns the patch, so the agent can never overwrite a trade the user saved a moment earlier.
+ */
 function setState_(patch) {
   var lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try {
     var st = readState_();
+    if (typeof patch === 'function') { patch = patch(st); if (!patch) return st; }
     var sh = stateSheet_();
     Object.keys(patch).forEach(function (k) {
       if (STATE_KEYS.indexOf(k) < 0) return;
@@ -272,30 +277,48 @@ function apiError_(code, message) {
 
 /* ---------- Gemini (REST) with retries and fallback models ---------- */
 
-function geminiGenerate_(request) {
+/** Model JSON, tolerant of a ```json fence around it. */
+function parseJSONLoose_(text) {
+  return JSON.parse(String(text).trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
+}
+
+/**
+ * opts.json: parse the answer (a cut-off or broken answer moves on to the next model).
+ * opts.deadline: stop before Apps Script's 6-minute kill. opts.light: fewer tries (the background agent).
+ */
+function geminiGenerate_(request, opts) {
+  opts = opts || {};
   var key = secret_('GEMINI_API_KEY');
   if (!key) throw apiError_('gemini_no_key', 'חסר מפתח Gemini. הזינו אותו בהגדרות.');
   var main = secret_('GEMINI_MODEL') || DEFAULT_MODEL;
-  var chain = [main].concat(FALLBACK_MODELS.filter(function (m) { return m !== main; }));
+  var chain = [main].concat(FALLBACK_MODELS.filter(function (m) { return m !== main; })).slice(0, opts.light ? 2 : 3);
+  var tries = opts.light ? 1 : 3;
+  var deadline = opts.deadline || (Date.now() + 5 * 60e3);
   var last = null;
   for (var mi = 0; mi < chain.length; mi++) {
     var model = chain[mi];
-    for (var attempt = 1; attempt <= 3; attempt++) {
+    for (var attempt = 1; attempt <= tries; attempt++) {
+      if (deadline - Date.now() < 45e3) throw last || apiError_('timeout', 'נגמר הזמן לניתוח. נסו שוב.');
       var r = fetchJSON_('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent', {
         method: 'post', contentType: 'application/json', headers: { 'x-goog-api-key': key }, payload: JSON.stringify(request)
       });
       if (r.code === 200 && r.body) {
         var cand = (r.body.candidates || [])[0] || {};
         var text = ((cand.content && cand.content.parts) || []).map(function (p) { return p.text || ''; }).join('');
-        if (!text) { last = apiError_('gemini_failed', 'תשובה ריקה מ-Gemini (' + (cand.finishReason || 'unknown') + ')'); break; }
-        return { text: text, model: model, grounding: cand.groundingMetadata || null };
+        if (!text || (cand.finishReason && cand.finishReason !== 'STOP')) { last = apiError_('gemini_failed', 'תשובה חלקית מ-Gemini (' + (cand.finishReason || 'empty') + ')'); break; }
+        var res = { text: text, model: model, grounding: cand.groundingMetadata || null };
+        if (opts.json) {
+          try { res.data = parseJSONLoose_(text); } catch (e) { last = apiError_('gemini_failed', 'Gemini החזיר תשובה לא תקינה'); break; }
+        }
+        return res;
       }
       var msg = (r.body && r.body.error && r.body.error.message) || r.text.slice(0, 300);
       if (r.code === 401 || r.code === 403 || /API key/i.test(msg)) throw apiError_('gemini_auth', msg);
-      if (r.code === 404) { last = apiError_('gemini_failed', msg); break; }
+      if (r.code === 400 || r.code === 404) { last = apiError_('gemini_failed', msg); break; }   // e.g. this model can't do search + schema
       if ([429, 500, 502, 503, 504].indexOf(r.code) < 0) throw apiError_('gemini_failed', msg);
       last = apiError_('gemini_busy', msg);
-      if (attempt < 3) Utilities.sleep(1200 * Math.pow(2, attempt - 1));
+      if (/per ?day|daily/i.test(msg)) break;                                                    // a daily quota won't clear in seconds
+      if (attempt < tries) Utilities.sleep(1200 * Math.pow(2, attempt - 1));
     }
   }
   throw last || apiError_('gemini_failed', 'unknown');
@@ -326,7 +349,10 @@ function getQuotes_(tickers) {
   // fallback for whatever Yahoo refused: Stooq's latest quote (no moving averages)
   if (retry.length) {
     var sreq = retry.map(function (t) {
-      return { url: 'https://stooq.com/q/l/?s=' + encodeURIComponent(toYahoo(t).toLowerCase().replace(/-/g, '.')) + '.us&f=sd2t2ohlcp&h&e=json', muteHttpExceptions: true };
+      // Stooq only knows US listings as .us: a foreign suffix (.TA) is asked as is
+      var sym = toYahoo(t).toLowerCase();
+      var st = /\.[a-z]+$/.test(sym) ? sym : sym.replace(/-/g, '.') + '.us';
+      return { url: 'https://stooq.com/q/l/?s=' + encodeURIComponent(st) + '&f=sd2t2ohlcp&h&e=json', muteHttpExceptions: true };
     });
     UrlFetchApp.fetchAll(sreq).forEach(function (res, i) {
       var t = retry[i];
@@ -359,7 +385,7 @@ function applyLive_(portfolio, quotes, at) {
   var hits = 0;
   var positions = portfolio.positions.map(function (p) {
     var q = quotes[String(p.ticker).toUpperCase()];
-    if (!q || !(q.price > 0)) return p;
+    if (!q || !(q.price > 0) || !currencyFits(p.currency || portfolio.currency, q.currency)) return p;
     hits++;
     var shares = Number(p.shares) || 0, avg = Number(p.avgPrice) || 0;
     return Object.assign({}, p, {
@@ -405,7 +431,7 @@ function notify_(list, settings) {
 
 /* ---------- digest ---------- */
 
-function runDigest_(portfolioIn) {
+function runDigest_(portfolioIn, gopts) {
   var t0 = Date.now();
   var portfolio = portfolioIn, liveCount = 0;
   try {
@@ -420,15 +446,15 @@ function runDigest_(portfolioIn) {
       generationConfig: { responseMimeType: 'application/json', responseJsonSchema: DIGEST_SCHEMA }
     };
     if (withSearch) req.tools = [{ google_search: {} }];
-    return geminiGenerate_(req);
+    return geminiGenerate_(req, Object.assign({ json: true }, gopts || {}));
   };
   var r, usedSearch = search;
   try { r = call(search); }
   catch (e) {
-    if (!search || /gemini_auth|gemini_no_key/.test(e.message)) throw e;
+    if (!search || /gemini_auth|gemini_no_key|"timeout"/.test(e.message)) throw e;
     usedSearch = false; r = call(false);
   }
-  var out = validateDigest(JSON.parse(r.text), portfolio);
+  var out = validateDigest(r.data, portfolio);
   var chunks = (r.grounding && r.grounding.groundingChunks) || [];
   var seen = {};
   out.sources = chunks.filter(function (c) { return c.web && c.web.uri && !seen[c.web.uri] && (seen[c.web.uri] = true); })
@@ -526,6 +552,7 @@ function setup() {
 }
 
 function agentTick() {
+  var t0 = Date.now();
   try { checkOrders_(); } catch (e) { console.warn('orders: ' + redact_(String(e.message || e))); }
   var st = readState_();
   if (!st.portfolio || !st.portfolio.positions || !st.portfolio.positions.length) return;
@@ -533,37 +560,47 @@ function agentTick() {
   var open = isUsMarketOpen(now);
   var meta = st.meta || {};
   var lastQ = meta.lastQuotesAt ? new Date(meta.lastQuotesAt).getTime() : 0;
-  var portfolio = st.portfolio;
 
   if (open || now.getTime() - lastQ > 60 * 60e3) {
     try {
-      var q = getQuotes_(portfolio.positions.map(function (p) { return p.ticker; }));
+      var q = getQuotes_(st.portfolio.positions.map(function (p) { return p.ticker; }));
       if (Object.keys(q.quotes).length) {
-        portfolio = applyLive_(portfolio, q.quotes, q.at);
-        meta = Object.assign({}, meta, { lastQuotesAt: q.at });
-        st = setState_({ portfolio: portfolio, meta: meta });
+        st = setState_(function (cur) {
+          if (!cur.portfolio) return null;
+          return { portfolio: applyLive_(cur.portfolio, q.quotes, q.at), meta: Object.assign({}, cur.meta, { lastQuotesAt: q.at }) };
+        });
+        meta = st.meta || {};
       }
     } catch (e) { console.warn('agent quotes: ' + e.message); }
   }
 
   if (open && (st.settings.alertTypes || {}).stop !== false) {
-    var stops = stopAlerts(portfolio, st.digest, st.alerts, now);
-    if (stops.length) {
-      st = setState_({ alerts: stops.concat(st.alerts || []) });
-      notify_(stops, st.settings);
-    }
+    var stops = [];
+    st = setState_(function (cur) {
+      stops = stopAlerts(cur.portfolio, cur.digest, cur.alerts, now);
+      return stops.length ? { alerts: stops.concat(cur.alerts || []) } : null;
+    });
+    if (stops.length) notify_(stops, st.settings);
   }
 
-  if (digestDue(st.settings, meta.lastDigestAt, now) && secret_('GEMINI_API_KEY')) {
+  // after a failure: wait 30 min, then 1h, 2h, 4h. The attempt is written BEFORE calling Gemini,
+  // so even Apps Script's 6-minute kill can't make it retry every 15 minutes.
+  var fails = meta.digestFails || 0;
+  var waitOk = !meta.lastDigestTryAt || now.getTime() - new Date(meta.lastDigestTryAt).getTime() >= 30 * 60e3 * Math.pow(2, Math.min(3, Math.max(0, fails - 1)));
+  if (digestDue(st.settings, meta.lastDigestAt, now) && waitOk && secret_('GEMINI_API_KEY')) {
+    setState_(function (cur) { return { meta: Object.assign({}, cur.meta, { lastDigestTryAt: now.toISOString(), digestFails: (cur.meta && cur.meta.digestFails || 0) + 1 }) }; });
     try {
-      var res = runDigest_(st.portfolio);
-      var cur = readState_();
-      var fresh = buildAlerts(cur.digest, res.digest, cur.portfolio, cur.settings, 'auto');
-      setState_({ digest: res.digest, alerts: fresh.concat(cur.alerts || []), meta: Object.assign({}, cur.meta, { lastDigestAt: res.digest.meta.at }) });
-      notify_(fresh, cur.settings);
+      var res = runDigest_(st.portfolio, { light: true, deadline: t0 + 5 * 60e3 });
+      var fresh = [];
+      var cur2 = setState_(function (cur) {
+        fresh = buildAlerts(cur.digest, res.digest, cur.portfolio, cur.settings, 'auto');
+        var m = Object.assign({}, cur.meta, { lastDigestAt: res.digest.meta.at });
+        delete m.lastDigestTryAt; delete m.digestFails; delete m.lastDigestError;
+        return { digest: res.digest, alerts: fresh.concat(cur.alerts || []), meta: m };
+      });
+      notify_(fresh, cur2.settings);
     } catch (e) {
-      // remember the failure so a broken key doesn't burn the daily quota every 15 minutes
-      setState_({ meta: Object.assign({}, readState_().meta, { lastDigestAt: now.toISOString(), lastDigestError: String(e.message).slice(0, 300) }) });
+      setState_(function (cur) { return { meta: Object.assign({}, cur.meta, { lastDigestError: redact_(String(e.message)).slice(0, 300) }) }; });
     }
   }
 }
@@ -599,6 +636,7 @@ function setDemo_(patch) {
   try {
     var sh = hiddenSheet_('_demo');
     var d = readDemo_();
+    if (typeof patch === 'function') { patch = patch(d); if (!patch) return d; }
     Object.keys(patch).forEach(function (k) {
       if (DEMO_KEYS.indexOf(k) < 0 || k === 'updatedAt') return;
       d[k] = patch[k];
@@ -694,8 +732,8 @@ function parseTrade_(text, mode) {
   var r = geminiGenerate_({
     contents: [{ role: 'user', parts: [{ text: tradeParsePrompt(text, pf) }] }],
     generationConfig: { responseMimeType: 'application/json', responseJsonSchema: TRADE_PARSE_SCHEMA }
-  });
-  var parsed = cleanParsedTrades(JSON.parse(r.text));
+  }, { json: true });
+  var parsed = cleanParsedTrades(r.data);
   var need = parsed.trades.filter(function (t) { return !(t.price > 0); }).map(function (t) { return t.ticker; });
   var quotes = need.length ? getQuotes_(need).quotes : {};
   parsed.trades.forEach(function (t) {
@@ -710,34 +748,42 @@ function applyTrades_(trades, mode, source) {
   mode = strictMode_(mode);
   if (!Array.isArray(trades) || !trades.length) throw apiError_('bad_request', 'אין פעולות לביצוע');
   if (mode === 'demo') {
-    var d = readDemo_();
-    if (!d.portfolio) throw apiError_('no_demo', 'מצב הדמו עוד לא התחיל.');
-    var res = applyTrades(d.portfolio, trades, { source: source || 'chat' });
-    if (!res.log.length) throw apiError_('trade_failed', res.results.map(function (x) { return x.error; }).filter(Boolean).join(' '));
-    setDemo_({ portfolio: res.portfolio });
+    var res = null;
+    setDemo_(function (d) {
+      if (!d.portfolio) throw apiError_('no_demo', 'מצב הדמו עוד לא התחיל.');
+      res = applyTrades(d.portfolio, trades, { source: source || 'chat' });
+      if (!res.log.length) throw apiError_('trade_failed', res.results.map(function (x) { return x.error; }).filter(Boolean).join(' '));
+      return { portfolio: res.portfolio };
+    });
     logDemo_(res.log);
     return { mode: 'demo', results: res.results, log: res.log, demo: demoView_() };
   }
-  var st = readState_();
-  if (!st.portfolio) throw apiError_('no_positions', 'אין תיק אמיתי. קודם מייבאים מבלינק.');
-  var out = applyTrades(st.portfolio, trades, { source: source || 'chat' });
-  if (!out.log.length) throw apiError_('trade_failed', out.results.map(function (x) { return x.error; }).filter(Boolean).join(' '));
-  var meta = Object.assign({}, st.meta, { trades: out.log.concat((st.meta && st.meta.trades) || []).slice(0, 100) });
-  var saved = setState_({ portfolio: out.portfolio, meta: meta });
+  var out = null;
+  var saved = setState_(function (st) {
+    if (!st.portfolio) throw apiError_('no_positions', 'אין תיק אמיתי. קודם מייבאים מבלינק.');
+    out = applyTrades(st.portfolio, trades, { source: source || 'chat' });
+    if (!out.log.length) throw apiError_('trade_failed', out.results.map(function (x) { return x.error; }).filter(Boolean).join(' '));
+    return { portfolio: out.portfolio, meta: Object.assign({}, st.meta, { trades: out.log.concat((st.meta && st.meta.trades) || []).slice(0, 100) }) };
+  });
   return { mode: 'live', results: out.results, log: out.log, portfolio: saved.portfolio, updatedAt: saved.updatedAt };
 }
 
 /* ---------- manual trades and limit orders (live and demo keep separate order books) ---------- */
 
 function ordersOf_(mode) { return ((mode === 'demo' ? readDemo_().orders : readState_().orders) || []); }
-function saveOrders_(mode, list) {
+/** change(list) → new list, run on the order book as it is inside the lock. */
+function saveOrders_(mode, change) {
   mode = strictMode_(mode);
-  list = list.filter(function (o) { return o.status === 'open' || o.status === 'triggered' || Date.now() - new Date(o.doneAt || o.at).getTime() < 7 * 864e5; }).slice(-50);
-  if (mode === 'demo') setDemo_({ orders: list }); else setState_({ orders: list });
+  var list;
+  var apply = function (book) {
+    list = change((book.orders || []).slice()).filter(function (o) { return o.status === 'open' || o.status === 'triggered' || Date.now() - new Date(o.doneAt || o.at).getTime() < 7 * 864e5; }).slice(-50);
+    return { orders: list };
+  };
+  if (mode === 'demo') setDemo_(apply); else setState_(apply);
   return list;
 }
 function markOrder_(mode, id, patch) {
-  return saveOrders_(mode, ordersOf_(mode).map(function (o) { return o.id === id ? Object.assign({}, o, patch) : o; }));
+  return saveOrders_(mode, function (l) { return l.map(function (o) { return o.id === id ? Object.assign({}, o, patch) : o; }); });
 }
 function errText_(e) {
   var m = String((e && e.message) || e);
@@ -768,7 +814,7 @@ function placeOrder_(o, mode) {
   var pv = previewTrade(portfolioFor_(mode), { type: t.type, ticker: t.ticker, shares: t.shares, price: t.price });
   if (!pv.ok) throw apiError_('trade_failed', pv.error);
   var order = { id: Utilities.getUuid().slice(0, 8), type: t.type, ticker: t.ticker, shares: pv.trade.shares, limit: t.price, status: 'open', at: new Date().toISOString() };
-  return { mode: mode, order: order, orders: saveOrders_(mode, ordersOf_(mode).concat([order])) };
+  return { mode: mode, order: order, orders: saveOrders_(mode, function (l) { return l.concat([order]); }) };
 }
 
 function cancelOrder_(id, mode) {
@@ -806,10 +852,10 @@ function checkOrders_() {
         return;
       }
       markOrder_('live', o.id, { status: 'triggered', price: q.price, triggeredAt: new Date().toISOString() });
-      var st = readState_(), at = new Date().toISOString();
+      var at = new Date().toISOString();
       var a = { id: at + '-' + o.ticker + '-order', at: at, kind: 'order', ticker: o.ticker, action: o.type === 'BUY' ? 'ADD' : 'TRIM', from: null, trigger: 'order',
         text: 'פקודת לימיט הגיעה למחיר ' + o.limit + ' (עכשיו ' + q.price + '). אם ביצעת בבלינק, אשר באפליקציה.' };
-      st = setState_({ alerts: [a].concat(st.alerts || []) });
+      var st = setState_(function (cur) { return { alerts: [a].concat(cur.alerts || []) }; });
       notify_([a], st.settings);
     });
   });
@@ -839,7 +885,7 @@ function analysts_(ticker, mode, refresh) {
     var req = { contents: [{ role: 'user', parts: [{ text: analystPrompt(ctx, { search: withSearch }) }] }],
       generationConfig: { responseMimeType: 'application/json', responseJsonSchema: ANALYST_SCHEMA } };
     if (withSearch) req.tools = [{ google_search: {} }];
-    return geminiGenerate_(req);
+    return geminiGenerate_(req, { json: true });
   };
   var r, usedSearch = search;
   try { r = call(search); }
@@ -850,7 +896,7 @@ function analysts_(ticker, mode, refresh) {
   var chunks = (r.grounding && r.grounding.groundingChunks) || [], seen = {};
   var out = {
     ticker: ticker, at: new Date().toISOString(), model: r.model, liveData: usedSearch, indicators: ind,
-    analysts: validateAnalysts(JSON.parse(r.text), ind.price, !!(position && position.shares > 0)),
+    analysts: validateAnalysts(r.data, ind.price, !!(position && position.shares > 0)),
     sources: chunks.filter(function (c) { return c.web && c.web.uri && !seen[c.web.uri] && (seen[c.web.uri] = true); })
       .slice(0, 6).map(function (c) { return { title: c.web.title || c.web.uri, url: c.web.uri }; })
   };
@@ -1180,7 +1226,14 @@ var __quotes = (function () {
 function toYahoo(ticker) {
   const t = String(ticker || '').trim().toUpperCase();
   if (!t || /\.CVR$|^CVR/.test(t)) return null;
-  return t.replace(/\./g, '-');
+  if (EXCHANGE_SUFFIX.test(t)) return t;            // TEVA.TA, VOD.L, SHOP.TO: Yahoo's own exchange suffix
+  return t.replace(/\./g, '-');                      // BRK.B -> BRK-B (US share classes)
+}
+const EXCHANGE_SUFFIX = /\.(TA|L|TO|V|DE|F|PA|AS|BR|MI|MC|SW|ST|OL|CO|HE|HK|T|KS|SS|SZ|AX|NZ|SA|MX|NS|BO)$/;
+/** Does this quote's currency fit the portfolio? (Tel Aviv quotes arrive in agorot and are turned into shekels.) */
+function currencyFits(portfolioCurrency, quoteCurrency) {
+  if (!portfolioCurrency || !quoteCurrency) return true;
+  return String(portfolioCurrency).toUpperCase() === String(quoteCurrency).toUpperCase();
 }
 
 const sma = (arr, n) => (arr.length >= n ? arr.slice(-n).reduce((a, b) => a + b, 0) / n : null);
@@ -1202,15 +1255,18 @@ function parseChart(json) {
   const lastIsCurrent = bars.length && m.regularMarketTime && day(bars.at(-1)[0]) === day(m.regularMarketTime);
   const prev = lastIsCurrent ? closes.at(-2) : closes.at(-1);
   const last20 = closes.slice(-20);
+  // Tel Aviv: Yahoo quotes in agorot (ILA). Everything here is in shekels.
+  const k = m.currency === 'ILA' ? 0.01 : 1;
+  const sc = v => (Number.isFinite(v) ? v * k : v);
   return {
-    price: round(price),
-    prevClose: round(prev),
+    price: round(sc(price)),
+    prevClose: round(sc(prev)),
     dayChangePct: Number.isFinite(prev) && prev ? round((price / prev - 1) * 100, 2) : null,
-    sma20: round(sma(closes, 20)),
-    sma50: round(sma(closes, 50)),
-    high20: last20.length ? round(Math.max(...last20)) : null,
-    low20: last20.length ? round(Math.min(...last20)) : null,
-    currency: m.currency || null,
+    sma20: round(sc(sma(closes, 20))),
+    sma50: round(sc(sma(closes, 50))),
+    high20: last20.length ? round(sc(Math.max(...last20))) : null,
+    low20: last20.length ? round(sc(Math.min(...last20))) : null,
+    currency: m.currency === 'ILA' ? 'ILS' : m.currency || null,
     exchange: m.exchangeName || null,
     marketTime: m.regularMarketTime ? new Date(m.regularMarketTime * 1000).toISOString() : null,
   };
@@ -1221,20 +1277,22 @@ function parseCandles(json) {
   const r = json?.chart?.result?.[0];
   if (!r) throw new Error(json?.chart?.error?.description || 'no data');
   const q = r.indicators?.quote?.[0] || {};
+  const k = r.meta?.currency === 'ILA' ? 0.01 : 1;
   const out = [];
   (r.timestamp || []).forEach((t, i) => {
     const o = q.open?.[i], h = q.high?.[i], l = q.low?.[i], c = q.close?.[i];
-    if ([o, h, l, c].every(Number.isFinite)) out.push({ t, o: round(o), h: round(h), l: round(l), c: round(c), v: q.volume?.[i] ?? null });
+    if ([o, h, l, c].every(Number.isFinite)) out.push({ t, o: round(o * k), h: round(h * k), l: round(l * k), c: round(c * k), v: q.volume?.[i] ?? null });
   });
-  return { candles: out, exchange: r.meta?.exchangeName || null, currency: r.meta?.currency || null, gmtoffset: r.meta?.gmtoffset || 0 };
+  return { candles: out, exchange: r.meta?.exchangeName || null, currency: r.meta?.currency === 'ILA' ? 'ILS' : r.meta?.currency || null, gmtoffset: r.meta?.gmtoffset || 0 };
 }
 
 const CANDLE_RANGES = { '3mo': '1d', '6mo': '1d', '1y': '1d', '2y': '1wk', '5y': '1wk' };
 
 
-return { toYahoo, parseChart, parseCandles, CANDLE_RANGES };
+return { toYahoo, currencyFits, parseChart, parseCandles, CANDLE_RANGES };
 })();
 var toYahoo = __quotes.toYahoo;
+var currencyFits = __quotes.currencyFits;
 var parseChart = __quotes.parseChart;
 var parseCandles = __quotes.parseCandles;
 var CANDLE_RANGES = __quotes.CANDLE_RANGES;
@@ -1252,9 +1310,17 @@ function nyParts(d) {
   return { weekday: o.weekday, date: `${o.year}-${o.month}-${o.day}`, mins: (+o.hour % 24) * 60 + +o.minute };
 }
 const isWeekday = d => !['Sat', 'Sun'].includes(nyParts(d).weekday);
+// NYSE full holidays and 13:00 early closes (New York dates). Years not listed fall back to weekdays only.
+const NYSE_CLOSED = new Set([
+  '2025-12-25',
+  '2026-01-01', '2026-01-19', '2026-02-16', '2026-04-03', '2026-05-25', '2026-06-19', '2026-07-03', '2026-09-07', '2026-11-26', '2026-12-25',
+  '2027-01-01', '2027-01-18', '2027-02-15', '2027-03-26', '2027-05-31', '2027-06-18', '2027-07-05', '2027-09-06', '2027-11-25', '2027-12-24',
+]);
+const NYSE_EARLY = new Set(['2025-12-24', '2026-11-27', '2026-12-24', '2027-11-26']);
+const isTradingDay = d => isWeekday(d) && !NYSE_CLOSED.has(nyParts(d).date);
 function isUsMarketOpen(d = new Date()) {
   const p = nyParts(d);
-  return isWeekday(d) && p.mins >= 570 && p.mins < 960;
+  return isTradingDay(d) && p.mins >= 570 && p.mins < (NYSE_EARLY.has(p.date) ? 780 : 960);
 }
 const nyDate = d => nyParts(d).date;
 
@@ -1265,7 +1331,7 @@ function digestDue(settings, lastAt, now = new Date()) {
   const last = lastAt ? new Date(lastAt) : null;
   if (f === 'eod') {
     const p = nyParts(now);
-    if (!isWeekday(now) || p.mins < 16 * 60 + 15) return false;          // 16:15 New York
+    if (!isTradingDay(now) || p.mins < 16 * 60 + 15) return false;       // 16:15 New York, trading days only
     return !last || nyDate(last) !== p.date || nyParts(last).mins < 16 * 60 + 15;
   }
   if (settings.marketHoursOnly && !isUsMarketOpen(now)) return false;
@@ -1297,7 +1363,9 @@ function buildAlerts(prevDigest, nextDigest, portfolio, settings, trigger) {
 function stopAlerts(portfolio, digest, alerts, now = new Date()) {
   const today = nyDate(now);
   const sentToday = new Set((alerts || []).filter(a => a.kind === 'stop' && nyDate(new Date(a.at)) === today).map(a => a.ticker));
-  const price = new Map((portfolio?.positions || []).filter(p => p.live?.price > 0).map(p => [p.ticker, p.live.price]));
+  // only fresh prices (a quote that failed to refresh must not fire a stop against yesterday's close)
+  const fresh = p => !p.live?.marketTime || now - new Date(p.live.marketTime) < 30 * 60e3;
+  const price = new Map((portfolio?.positions || []).filter(p => p.live?.price > 0 && fresh(p)).map(p => [p.ticker, p.live.price]));
   const at = now.toISOString();
   const out = [];
   for (const v of digest?.positions || []) {
@@ -1318,11 +1386,12 @@ function alertText(a) {
 }
 
 
-return { ACTION_KIND, ACTION_HE, isWeekday, isUsMarketOpen, nyDate, digestDue, buildAlerts, stopAlerts, alertText };
+return { ACTION_KIND, ACTION_HE, isWeekday, isTradingDay, isUsMarketOpen, nyDate, digestDue, buildAlerts, stopAlerts, alertText };
 })();
 var ACTION_KIND = __agent.ACTION_KIND;
 var ACTION_HE = __agent.ACTION_HE;
 var isWeekday = __agent.isWeekday;
+var isTradingDay = __agent.isTradingDay;
 var isUsMarketOpen = __agent.isUsMarketOpen;
 var nyDate = __agent.nyDate;
 var digestDue = __agent.digestDue;

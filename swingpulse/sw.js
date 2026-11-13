@@ -8,8 +8,10 @@ async function latest() {
     const cache = await caches.open('sp-config');
     const res = await cache.match(CONFIG_URL);
     const cfg = res ? await res.json() : null;
-    if (!cfg || !cfg.api || !cfg.t) return [];
-    const r = await fetch(cfg.api, { method: 'POST', body: JSON.stringify({ t: cfg.t, fn: 'latestAlerts', args: [] }), redirect: 'follow' });
+    if (!cfg || !cfg.api || !(cfg.t || cfg.pk)) return [];
+    // personal server: access code; Google account: a device key that can only read the newest alerts
+    const body = cfg.pk ? { pk: cfg.pk, fn: 'latestAlerts', args: [] } : { t: cfg.t, fn: 'latestAlerts', args: [] };
+    const r = await fetch(cfg.api, { method: 'POST', body: JSON.stringify(body), redirect: 'follow' });
     const j = await r.json();
     return j.ok ? j.result : [];
   } catch (e) { return []; }
