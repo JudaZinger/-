@@ -8,7 +8,7 @@
    Secrets live in Script Properties (only the owner can read them).
    =================================================================================== */
 
-var GAS_VERSION = '6.2.1';
+var GAS_VERSION = '6.3.0';
 var DEFAULT_MODEL = 'gemini-flash-latest';
 var FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash'];
 var CELL_MAX = 45000;                 // a Sheets cell holds 50,000 characters; keep a margin
@@ -31,6 +31,7 @@ function doGet() {
 var RPC = {
   health: function () { return apiHealth(); },
   getState: function () { return readState_(); },
+  exportData: function () { return { exportedAt: new Date().toISOString(), state: readState_(), demo: readDemo_() }; },
   putState: function (patch) { return setState_(patch || {}); },
   quotes: function (tickers) { return quotesWithFx_(tickers || []); },
   candles: function (ticker, range) { return getCandles_(ticker, range); },

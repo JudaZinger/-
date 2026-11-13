@@ -199,7 +199,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.2.1";
+var APP_VERSION = "6.3.0";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -818,6 +818,12 @@ var logout = async () => {
     return { ok: true };
   }
   return apiJSON(LOGOUT_URL, { method: "POST" });
+};
+var exportMyData = () => rpc("exportData");
+var deleteMyAccount = async () => {
+  await rpc("deleteAccount", "DELETE");
+  await logout().catch(() => {
+  });
 };
 var testTelegram = () => REMOTE ? rpc("testTelegram") : GAS ? gasCall("apiTestTelegram") : apiJSON(TELEGRAM_TEST_URL, { method: "POST" });
 var testPush = () => rpc("testPush");
@@ -1600,6 +1606,10 @@ function ImportModal({ open, onClose, onExtracted, serverOk, hasPortfolio, fromD
                   }
                 ) })
               ] }) : /* @__PURE__ */ jsxs(Fragment, { children: [
+                /* @__PURE__ */ jsxs("p", { className: "rounded-xl border border-[color:var(--line)] bg-[color:var(--inset)] px-3 py-2 text-xs leading-5 text-[color:var(--fg-3)]", children: [
+                  "הצילומים נשלחים לפענוח ב-Google Gemini, ובגרסה החינמית Google עשויה להשתמש בהם לשיפור השירות. לפני ההעלאה כדאי לחתוך או להסתיר מספר חשבון, תעודת זהות ושם. ",
+                  /* @__PURE__ */ jsx("a", { href: "privacy.html", target: "_blank", rel: "noopener", className: "underline", children: "פרטים" })
+                ] }),
                 /* @__PURE__ */ jsx("div", { role: "radiogroup", "aria-label": "מאיזה חשבון הצילומים", className: "grid gap-2 sm:grid-cols-2", children: [["US", "🇺🇸", "צילום מסך ארה״ב", "בלינק / ברוקר זר · $"], ["IL", "🇮🇱", "צילום מסך ישראל", "חשבון בנק / בורסת ת״א · ₪"]].map(([id, flag, title, sub]) => /* @__PURE__ */ jsxs(
                   "button",
                   {
@@ -2885,7 +2895,61 @@ function SettingsTab({ settings, setSettings, nextRun, now, health, serverOk, on
         /* @__PURE__ */ jsx("div", { className: "text-xs text-[color:var(--fg-3)]", children: serverOk && health ? `מודל ${health.model} · ${health.search ? "המלצות עם חיפוש Google עדכני" : "המלצות לפי נתוני התיק בלבד"} · עד ${health.maxFiles} צילומים` : REMOTE || GAS ? "אין חיבור לשרת כרגע" : "הפעילו start.bat ופתחו http://localhost:5001/app" })
       ] }),
       health?.auth && /* @__PURE__ */ jsx("button", { type: "button", onClick: onLogout, className: "ms-auto rounded-xl border border-[color:var(--line-2)] px-3 py-2 text-sm hover:bg-[color:var(--tint)]", children: "התנתקות" })
-    ] })
+    ] }),
+    REMOTE && !SANDBOX && /* @__PURE__ */ jsx(PrivacySection, { cloud: health?.platform === "cloud" })
+  ] });
+}
+function PrivacySection({ cloud }) {
+  const [msg, setMsg] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function doExport() {
+    setBusy(true);
+    setMsg("");
+    try {
+      const data = await exportMyData();
+      const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: "application/json" }));
+      const a = Object.assign(document.createElement("a"), { href: url, download: `swingpulse-data-${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.json` });
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2e3);
+      setMsg("הקובץ ירד למכשיר.");
+    } catch (e) {
+      setMsg(e.message || "הייצוא נכשל");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function doDelete() {
+    if (confirm !== "מחק") return;
+    setBusy(true);
+    setMsg("");
+    try {
+      await deleteMyAccount();
+      location.replace(location.pathname);
+    } catch (e) {
+      setMsg(e.message || "המחיקה נכשלה");
+      setBusy(false);
+    }
+  }
+  return /* @__PURE__ */ jsxs("section", { className: "flex flex-col gap-3 rounded-2xl border border-[color:var(--line)] bg-[color:var(--card)] p-5 text-sm", children: [
+    /* @__PURE__ */ jsx("h3", { className: "font-semibold", children: "הנתונים שלי" }),
+    /* @__PURE__ */ jsxs("p", { className: "text-xs text-[color:var(--fg-3)]", children: [
+      "לפי חוק הגנת הפרטיות מותר לעיין בכל המידע שנשמר עליך ולבקש למחוק אותו. ",
+      /* @__PURE__ */ jsx(LegalLinks, { className: "!inline-flex !justify-start" })
+    ] }),
+    /* @__PURE__ */ jsx("div", { className: "flex flex-wrap gap-2", children: /* @__PURE__ */ jsx("button", { type: "button", onClick: doExport, disabled: busy, className: "rounded-xl border border-[color:var(--line-2)] px-3 py-2 hover:bg-[color:var(--tint)] disabled:opacity-50", children: "הורדת כל הנתונים (JSON)" }) }),
+    cloud && /* @__PURE__ */ jsxs("div", { className: "flex flex-col gap-2 rounded-xl border p-3", style: { borderColor: "var(--down)" }, children: [
+      /* @__PURE__ */ jsx("b", { className: "text-[color:var(--down)]", children: "מחיקת החשבון" }),
+      /* @__PURE__ */ jsx("span", { className: "text-xs text-[color:var(--fg-3)]", children: "מוחק לצמיתות את התיקים, הדמו, ההתראות, המכשירים וההתחברות. אי אפשר לשחזר." }),
+      /* @__PURE__ */ jsxs("label", { className: "flex flex-col gap-1 text-xs", children: [
+        "כדי לאשר, כתבו: מחק",
+        /* @__PURE__ */ jsx("input", { value: confirm, onChange: (e) => setConfirm(e.target.value), className: "min-h-10 rounded-lg border border-[color:var(--line-2)] bg-[color:var(--input)] px-3 text-base outline-none" })
+      ] }),
+      /* @__PURE__ */ jsx("button", { type: "button", onClick: doDelete, disabled: busy || confirm !== "מחק", className: "self-start rounded-xl px-3 py-2 font-semibold text-white disabled:opacity-40", style: { background: "var(--down)" }, children: "מחיקה לצמיתות" })
+    ] }),
+    msg && /* @__PURE__ */ jsx("div", { role: "status", className: "text-xs text-[color:var(--fg-2)]", children: msg })
   ] });
 }
 function AlertsTab({ alerts, clearAlerts }) {
@@ -3904,7 +3968,47 @@ var SETUP_STEPS = [
   "את מפתח Gemini (חינם) מוסיפים אחר כך במסך ההגדרות."
 ];
 var CODE_GS_URL = "https://raw.githubusercontent.com/JudaZinger/-/main/swingpulse/Code.gs";
+var LEGAL_VERSION = "2026-11-14";
+var LS_LEGAL = "swingpulse.legal";
+var legalAccepted = () => {
+  try {
+    return localStorage.getItem(LS_LEGAL) === LEGAL_VERSION;
+  } catch {
+    return false;
+  }
+};
+var acceptLegal = () => {
+  try {
+    localStorage.setItem(LS_LEGAL, LEGAL_VERSION);
+  } catch {
+  }
+};
+var LEGAL_LINKS = [["terms.html", "תנאי שימוש"], ["privacy.html", "פרטיות"], ["accessibility.html", "נגישות"]];
+function LegalLinks({ className = "" }) {
+  return /* @__PURE__ */ jsx("nav", { "aria-label": "מסמכים משפטיים", className: `flex flex-wrap items-center justify-center gap-x-3 gap-y-1 ${className}`, children: LEGAL_LINKS.map(([href, label]) => /* @__PURE__ */ jsx("a", { href, target: "_blank", rel: "noopener", className: "underline decoration-[color:var(--line-2)] underline-offset-2 hover:text-[color:var(--fg-2)]", children: label }, href)) });
+}
+function LegalConsent({ checked, onChange }) {
+  return /* @__PURE__ */ jsxs("label", { className: "flex cursor-pointer items-start gap-3 rounded-2xl border border-[color:var(--line)] bg-[color:var(--inset)] p-3 text-xs leading-5 text-[color:var(--fg-2)]", children: [
+    /* @__PURE__ */ jsx("input", { type: "checkbox", checked, onChange: (e) => onChange(e.target.checked), className: "mt-0.5 h-5 w-5 flex-none accent-[#0a84ff]" }),
+    /* @__PURE__ */ jsxs("span", { children: [
+      "אני בן/בת 18 ומעלה, קראתי ואני מסכים/ה ל",
+      /* @__PURE__ */ jsx("a", { href: "terms.html", target: "_blank", rel: "noopener", className: "text-[color:var(--accent)] underline", children: "תנאי השימוש" }),
+      " ול",
+      /* @__PURE__ */ jsx("a", { href: "privacy.html", target: "_blank", rel: "noopener", className: "text-[color:var(--accent)] underline", children: "מדיניות הפרטיות" }),
+      ". ידוע לי ש-SwingPulse אינו ייעוץ השקעות, שההמלצות נוצרות אוטומטית ב-AI ועלולות לטעות, ושנתונים שאני מעלה נשלחים לעיבוד ב-Google Gemini."
+    ] })
+  ] });
+}
 function LoginScreen({ onDone, theme, onToggleTheme }) {
+  const [agreed, setAgreedRaw] = useState(legalAccepted);
+  const setAgreed = (v) => {
+    setAgreedRaw(v);
+    if (v) acceptLegal();
+    else try {
+      localStorage.removeItem(LS_LEGAL);
+    } catch {
+    }
+  };
   const [step, setStep] = useState(REMOTE && getToken() && !SB ? "live" : "choose");
   const [url, setUrl] = useState(REMOTE_API);
   const [pw, setPw] = useState("");
@@ -3912,6 +4016,10 @@ function LoginScreen({ onDone, theme, onToggleTheme }) {
   const [err, setErr] = useState(CLOUD_ERROR || "");
   const [gBusy, setGBusy] = useState(false);
   async function google2() {
+    if (!agreed) {
+      setErr("כדי להמשיך צריך לאשר את התנאים");
+      return;
+    }
     setGBusy(true);
     setErr("");
     try {
@@ -3924,6 +4032,10 @@ function LoginScreen({ onDone, theme, onToggleTheme }) {
   async function submit(e) {
     e.preventDefault();
     if (!pw) return;
+    if (REMOTE && !agreed) {
+      setErr("כדי להמשיך צריך לאשר את התנאים");
+      return;
+    }
     setBusy(true);
     setErr("");
     try {
@@ -3962,14 +4074,15 @@ function LoginScreen({ onDone, theme, onToggleTheme }) {
             err && /* @__PURE__ */ jsx("div", { className: "text-sm text-[color:var(--down)]", children: err }),
             /* @__PURE__ */ jsx("button", { type: "submit", disabled: busy || !pw, className: "min-h-11 rounded-xl bg-[#0a84ff] font-semibold text-white disabled:opacity-40", children: busy ? "מתחבר…" : "כניסה" })
           ] }) : step === "choose" ? /* @__PURE__ */ jsxs("div", { className: "sp-stagger flex flex-col gap-3", children: [
+            /* @__PURE__ */ jsx(LegalConsent, { checked: agreed, onChange: setAgreed }),
             SB && /* @__PURE__ */ jsxs(Fragment, { children: [
               /* @__PURE__ */ jsxs(
                 "button",
                 {
                   type: "button",
                   onClick: google2,
-                  disabled: gBusy,
-                  className: "sp-press flex min-h-12 w-full items-center justify-center gap-3 rounded-2xl bg-white px-4 text-base font-semibold text-[#1f1f1f] shadow-sm ring-1 ring-black/10 disabled:opacity-60",
+                  disabled: gBusy || !agreed,
+                  className: "sp-press flex min-h-12 w-full items-center justify-center gap-3 rounded-2xl bg-white px-4 text-base font-semibold text-[#1f1f1f] shadow-sm ring-1 ring-black/10 disabled:cursor-not-allowed disabled:opacity-45 disabled:grayscale",
                   children: [
                     /* @__PURE__ */ jsxs("svg", { viewBox: "0 0 48 48", className: "h-5 w-5", "aria-hidden": "true", children: [
                       /* @__PURE__ */ jsx("path", { fill: "#EA4335", d: "M24 9.5c3.5 0 6.6 1.2 9.1 3.6l6.8-6.8C35.8 2.4 30.3 0 24 0 14.6 0 6.6 5.4 2.7 13.2l7.9 6.1C12.5 13.6 17.8 9.5 24 9.5z" }),
@@ -3989,14 +4102,14 @@ function LoginScreen({ onDone, theme, onToggleTheme }) {
                 /* @__PURE__ */ jsx("span", { className: "h-px flex-1 bg-[color:var(--line)]" })
               ] })
             ] }),
-            /* @__PURE__ */ jsxs("button", { type: "button", onClick: enterSandbox, className: card, style: { borderColor: "var(--warn-line)" }, children: [
+            /* @__PURE__ */ jsxs("button", { type: "button", onClick: enterSandbox, disabled: !agreed, className: `${card} disabled:opacity-45`, style: { borderColor: "var(--warn-line)" }, children: [
               /* @__PURE__ */ jsx("span", { className: "mt-0.5 grid h-9 w-9 flex-none place-items-center rounded-xl font-bold", style: { background: "var(--warn-bg)", color: "var(--warn)" }, children: "0" }),
               /* @__PURE__ */ jsxs("span", { className: "min-w-0 flex-1", children: [
                 /* @__PURE__ */ jsx("b", { className: "block", children: "כניסה למצב דמו" }),
                 /* @__PURE__ */ jsx("span", { className: "block text-sm text-[color:var(--fg-3)]", children: "נסה עכשיו, בלי להירשם. תיק לדוגמה שנשמר רק בדפדפן הזה." })
               ] })
             ] }),
-            /* @__PURE__ */ jsxs("button", { type: "button", onClick: () => setStep("live"), className: card, style: { borderColor: "var(--accent-line)" }, children: [
+            /* @__PURE__ */ jsxs("button", { type: "button", onClick: () => setStep("live"), disabled: !agreed, className: `${card} disabled:opacity-45`, style: { borderColor: "var(--accent-line)" }, children: [
               /* @__PURE__ */ jsx("span", { className: "mt-0.5 grid h-9 w-9 flex-none place-items-center rounded-xl", style: { background: "var(--accent-bg)", color: "var(--accent)" }, children: /* @__PURE__ */ jsx(Icon, { name: "link", className: "h-4 w-4" }) }),
               /* @__PURE__ */ jsxs("span", { className: "min-w-0 flex-1", children: [
                 /* @__PURE__ */ jsx("b", { className: "block", children: SB ? "שרת משלך (מתקדם)" : "הגדר חשבון אישי (Live)" }),
@@ -4013,7 +4126,8 @@ function LoginScreen({ onDone, theme, onToggleTheme }) {
               /* @__PURE__ */ jsx("input", { type: "password", autoComplete: "current-password", autoFocus: true, value: pw, onChange: (e) => setPw(e.target.value), dir: "ltr", className: field })
             ] }),
             err && /* @__PURE__ */ jsx("div", { className: "text-sm text-[color:var(--down)]", children: err }),
-            /* @__PURE__ */ jsx("button", { type: "submit", disabled: busy || !pw || !url, className: "min-h-11 rounded-xl bg-[#0a84ff] font-semibold text-white disabled:opacity-40", children: busy ? "מתחבר…" : "התחברות" }),
+            !agreed && /* @__PURE__ */ jsx(LegalConsent, { checked: agreed, onChange: setAgreed }),
+            /* @__PURE__ */ jsx("button", { type: "submit", disabled: busy || !pw || !url || !agreed, className: "min-h-11 rounded-xl bg-[#0a84ff] font-semibold text-white disabled:opacity-40", children: busy ? "מתחבר…" : "התחברות" }),
             /* @__PURE__ */ jsxs("details", { className: "rounded-xl border border-[color:var(--line)] p-3 text-sm", children: [
               /* @__PURE__ */ jsx("summary", { className: "cursor-pointer font-semibold", children: "איך מקימים שרת משלך (5 דקות, חינם)" }),
               /* @__PURE__ */ jsx("ol", { className: "mt-2 flex list-decimal flex-col gap-1.5 ps-5 text-[color:var(--fg-2)]", children: SETUP_STEPS.map((t) => /* @__PURE__ */ jsx("li", { children: t }, t)) }),
@@ -4026,7 +4140,8 @@ function LoginScreen({ onDone, theme, onToggleTheme }) {
               setStep("choose");
               setErr("");
             }, className: "text-sm text-[color:var(--fg-3)] hover:underline", children: "חזרה" })
-          ] })
+          ] }),
+          /* @__PURE__ */ jsx(LegalLinks, { className: "text-xs text-[color:var(--fg-4)]" })
         ] })
       ]
     }
@@ -4689,14 +4804,15 @@ function SwingPulseApp() {
           ] }) }, tab),
           /* @__PURE__ */ jsxs("p", { className: "text-center text-xs text-[color:var(--fg-4)]", children: [
             viewDigest?.meta ? `${viewDigest.meta.model} · ${viewDigest.meta.liveData ? "עם נתוני חיפוש עדכניים" : "ללא נתוני שוק חיים"} · ` : "",
-            "כלי עזר להחלטה, לא ייעוץ השקעות. · ",
+            "מידע כללי שנוצר אוטומטית, לא ייעוץ השקעות ולא תחליף לייעוץ מותאם אישית. מחירים עשויים להיות מעוכבים. · ",
             /* @__PURE__ */ jsxs("span", { dir: "ltr", children: [
               "SwingPulse v",
               APP_VERSION,
               " · ",
               APP_ENGINE
             ] })
-          ] })
+          ] }),
+          /* @__PURE__ */ jsx(LegalLinks, { className: "-mt-2 text-xs text-[color:var(--fg-4)]" })
         ] }),
         /* @__PURE__ */ jsx("nav", { className: "fixed inset-x-0 bottom-0 z-30 border-t border-[color:var(--line)] bg-[color:var(--nav)] px-2 pb-[max(env(safe-area-inset-bottom),0.4rem)] pt-1.5 backdrop-blur-xl md:hidden", "aria-label": "ניווט", children: /* @__PURE__ */ jsx(
           Segmented,
@@ -4758,8 +4874,10 @@ export {
   buildPlan,
   cleanNotes,
   SwingPulse as default,
+  deleteMyAccount,
   demoApi,
   enablePush,
+  exportMyData,
   extractPortfolio,
   fetchCandles,
   fetchHealth,
