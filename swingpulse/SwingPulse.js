@@ -34,7 +34,7 @@ function previewTrade(portfolio, raw) {
   const type = TRADE_TYPES.includes(raw && raw.type) ? raw.type : null;
   const ticker = T(raw && raw.ticker);
   const price = n(raw && raw.price);
-  const pos = findPos(portfolio, ticker);
+  const pos2 = findPos(portfolio, ticker);
   const cashBefore = n(portfolio && portfolio.cashBalance) || 0;
   const fail = (error) => ({ ok: false, error, trade: { type, ticker, shares: n(raw && raw.shares), price } });
   if (!type) return fail("סוג הפעולה לא ברור (קנייה או מכירה).");
@@ -43,7 +43,7 @@ function previewTrade(portfolio, raw) {
   if (type === "BUY") {
     const shares2 = n(raw.shares);
     if (!(shares2 > 0)) return fail(`חסרה כמות לקנייה של ${ticker}.`);
-    const beforeShares = pos ? n(pos.shares) || 0 : 0, beforeAvg = pos ? n(pos.avgPrice) : null;
+    const beforeShares = pos2 ? n(pos2.shares) || 0 : 0, beforeAvg = pos2 ? n(pos2.avgPrice) : null;
     const afterShares = beforeShares + shares2;
     const afterAvg = beforeShares && beforeAvg != null ? (beforeShares * beforeAvg + shares2 * price) / afterShares : price;
     const amount2 = r2(shares2 * price);
@@ -58,12 +58,12 @@ function previewTrade(portfolio, raw) {
       cashBefore: r2(cashBefore),
       cashAfter,
       realized: 0,
-      isNew: !pos,
+      isNew: !pos2,
       closes: false
     };
   }
-  if (!pos) return fail(`${ticker} לא נמצאת בתיק, אז אין מה למכור.`);
-  const have = n(pos.shares) || 0, avg = n(pos.avgPrice);
+  if (!pos2) return fail(`${ticker} לא נמצאת בתיק, אז אין מה למכור.`);
+  const have = n(pos2.shares) || 0, avg = n(pos2.avgPrice);
   const shares = type === "SELL_ALL" ? have : n(raw.shares);
   if (!(shares > 0)) return fail(`חסרה כמות למכירה של ${ticker}.`);
   if (shares > have + 1e-9) return fail(`בתיק יש ${r4(have)} מניות ${ticker}, אי אפשר למכור ${r4(shares)}.`);
@@ -91,17 +91,17 @@ function applyTrades(portfolio, trades, { at = (/* @__PURE__ */ new Date()).toIS
     results.push(pv);
     if (!pv.ok) continue;
     const t = pv.trade;
-    let pos = findPos(pf, t.ticker);
+    let pos2 = findPos(pf, t.ticker);
     if (t.type === "BUY") {
-      if (!pos) {
-        pos = { ticker: t.ticker, companyName: raw.companyName || t.ticker, shares: 0, avgPrice: t.price, currentPrice: t.price };
-        pf.positions.push(pos);
+      if (!pos2) {
+        pos2 = { ticker: t.ticker, companyName: raw.companyName || t.ticker, shares: 0, avgPrice: t.price, currentPrice: t.price };
+        pf.positions.push(pos2);
       }
-      pos.shares = pv.after.shares;
-      pos.avgPrice = pv.after.avgPrice;
-      if (n(pos.currentPrice) == null) pos.currentPrice = t.price;
+      pos2.shares = pv.after.shares;
+      pos2.avgPrice = pv.after.avgPrice;
+      if (n(pos2.currentPrice) == null) pos2.currentPrice = t.price;
     } else {
-      pos.shares = pv.after.shares;
+      pos2.shares = pv.after.shares;
     }
     pf.cashBalance = pv.cashAfter;
     pf.realizedPnl = r2((n(pf.realizedPnl) || 0) + pv.realized);
@@ -120,6 +120,25 @@ function marketOf(ticker) {
   return /\.TA$/.test(t) || /^\d{5,9}$/.test(t) ? "IL" : "US";
 }
 var bookKey = (market) => market === "IL" ? "portfolioIL" : "portfolio";
+var num = (v) => v == null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v);
+var pos = (v) => num(v) != null && num(v) > 0;
+function repairILBook(book) {
+  if (!book || !Array.isArray(book.positions)) return { book, changed: false };
+  let changed = false;
+  const positions = book.positions.map((p) => {
+    const price = num(p.currentPrice), avg = num(p.avgPrice), shares = num(p.shares);
+    if (!pos(price) || !pos(avg) || avg / price <= 20) return p;
+    changed = true;
+    const a = avg / 100;
+    return {
+      ...p,
+      avgPrice: Math.round(a * 1e6) / 1e6,
+      unrealizedPnl: pos(shares) ? Math.round(shares * (price - a) * 100) / 100 : p.unrealizedPnl,
+      unrealizedPnlPct: Math.round((price / a - 1) * 1e4) / 100
+    };
+  });
+  return { book: changed ? { ...book, positions } : book, changed };
+}
 function convert(amount, from, to, rate) {
   const a = Number(amount);
   if (!Number.isFinite(a) || from === to) return a;
@@ -180,7 +199,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.2.0";
+var APP_VERSION = "6.2.1";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -465,13 +484,13 @@ async function rpc(fn, ...args) {
 var SANDBOX_NO_AI = "בדמו המקומי אין שרת ו-AI. כדי לקבל המלצות וניתוח, חברו חשבון אישי.";
 function sandboxSeed() {
   const at = (/* @__PURE__ */ new Date()).toISOString();
-  const pos = (ticker, companyName, shares, avgPrice, currentPrice) => ({ ticker, companyName, shares, avgPrice, currentPrice });
+  const pos2 = (ticker, companyName, shares, avgPrice, currentPrice) => ({ ticker, companyName, shares, avgPrice, currentPrice });
   const portfolio = recomputePortfolio({ currency: "USD", cashBalance: 2500, importedAt: at, sample: true, positions: [
-    pos("AAPL", "Apple", 15, 185, 228),
-    pos("MSFT", "Microsoft", 8, 380, 425),
-    pos("NVDA", "NVIDIA", 25, 95, 138),
-    pos("AMZN", "Amazon", 12, 160, 198),
-    pos("GOOGL", "Alphabet", 14, 140, 172)
+    pos2("AAPL", "Apple", 15, 185, 228),
+    pos2("MSFT", "Microsoft", 8, 380, 425),
+    pos2("NVDA", "NVIDIA", 25, 95, 138),
+    pos2("AMZN", "Amazon", 12, 160, 198),
+    pos2("GOOGL", "Alphabet", 14, 140, 172)
   ] });
   const v = (ticker, action, verdict, trailingStop, target) => ({ ticker, action, verdict, bullets: ["דוגמה בלבד, לא המלצה אמיתית."], trailingStop, target, confidence: "medium", dataNote: "" });
   const digest = {
@@ -2363,7 +2382,7 @@ function StockSheet({ position, verdict, currency, onClose, mode = "live", demoS
   const stop = validStop(verdict, p.currentPrice);
   const target = verdict?.target ?? null;
   const room = stopRoom(p.currentPrice, stop);
-  const pos = (p.pnl ?? 0) >= 0;
+  const pos2 = (p.pnl ?? 0) >= 0;
   const day = q.dayChangePct;
   const trend = (px, m) => px != null && m != null ? px >= m ? "up" : "down" : null;
   const exchange = q.exchange ? TV_EXCHANGE[q.exchange] || q.exchange : null;
@@ -2441,7 +2460,7 @@ function StockSheet({ position, verdict, currency, onClose, mode = "live", demoS
                 /* @__PURE__ */ jsx(Metric, { label: "כמות", value: qty(p.shares) }),
                 /* @__PURE__ */ jsx(Metric, { label: "מחיר קנייה", value: fmt(p.avgPrice) }),
                 /* @__PURE__ */ jsx(Metric, { label: "שווי", value: money(p.value, currency) }),
-                /* @__PURE__ */ jsx(Metric, { label: "רווח/הפסד", value: `${signedMoney(p.pnl, currency)} (${signedPct(p.pnlPct)})`, tone: pos ? "up" : "down" }),
+                /* @__PURE__ */ jsx(Metric, { label: "רווח/הפסד", value: `${signedMoney(p.pnl, currency)} (${signedPct(p.pnlPct)})`, tone: pos2 ? "up" : "down" }),
                 /* @__PURE__ */ jsx(Metric, { label: "מהתיק", value: p.allocationPct != null ? `${fmt(p.allocationPct, 1)}%` : "—" }),
                 /* @__PURE__ */ jsx(Metric, { label: "MA20", value: fmt(q.sma20), tone: trend(p.currentPrice, q.sma20) }),
                 /* @__PURE__ */ jsx(Metric, { label: "MA50", value: fmt(q.sma50), tone: trend(p.currentPrice, q.sma50) }),
@@ -2527,7 +2546,7 @@ function TableTab({ portfolio, rows, stats, verdictOf, digestState, sort, setSor
       /* @__PURE__ */ jsx("thead", { children: /* @__PURE__ */ jsx("tr", { children: TABLE_COLUMNS.map(head) }) }),
       /* @__PURE__ */ jsx("tbody", { children: sorted.map((p) => {
         const v = verdictOf(p.ticker);
-        const pos = (p.pnl ?? 0) >= 0;
+        const pos2 = (p.pnl ?? 0) >= 0;
         return /* @__PURE__ */ jsxs("tr", { onClick: () => onOpen?.(p.ticker), className: "cursor-pointer hover:bg-[color:var(--tint)]", children: [
           /* @__PURE__ */ jsx("td", { className: "sticky right-0 z-[1] whitespace-nowrap border-b border-[color:var(--line-soft)] bg-[color:var(--card)] px-3 py-3", children: /* @__PURE__ */ jsxs("span", { className: "flex items-center gap-1.5", children: [
             /* @__PURE__ */ jsx("b", { dir: "ltr", children: p.ticker }),
@@ -2538,8 +2557,8 @@ function TableTab({ portfolio, rows, stats, verdictOf, digestState, sort, setSor
           /* @__PURE__ */ jsx("td", { className: "whitespace-nowrap border-b border-[color:var(--line-soft)] px-3 py-3", children: /* @__PURE__ */ jsx(Num, { children: fmt(p.avgPrice) }) }),
           /* @__PURE__ */ jsx("td", { className: "whitespace-nowrap border-b border-[color:var(--line-soft)] px-3 py-3", children: /* @__PURE__ */ jsx(Num, { children: fmt(p.currentPrice) }) }),
           /* @__PURE__ */ jsx("td", { className: "whitespace-nowrap border-b border-[color:var(--line-soft)] px-3 py-3", children: /* @__PURE__ */ jsx(Num, { children: money(p.value, cur) }) }),
-          /* @__PURE__ */ jsx("td", { className: "whitespace-nowrap border-b border-[color:var(--line-soft)] px-3 py-3", children: /* @__PURE__ */ jsx(Num, { className: pos ? "text-[color:var(--up)]" : "text-[color:var(--down)]", children: signedMoney(p.pnl, cur) }) }),
-          /* @__PURE__ */ jsx("td", { className: "whitespace-nowrap border-b border-[color:var(--line-soft)] px-3 py-3", children: /* @__PURE__ */ jsx(Num, { className: pos ? "text-[color:var(--up)]" : "text-[color:var(--down)]", children: signedPct(p.pnlPct) }) }),
+          /* @__PURE__ */ jsx("td", { className: "whitespace-nowrap border-b border-[color:var(--line-soft)] px-3 py-3", children: /* @__PURE__ */ jsx(Num, { className: pos2 ? "text-[color:var(--up)]" : "text-[color:var(--down)]", children: signedMoney(p.pnl, cur) }) }),
+          /* @__PURE__ */ jsx("td", { className: "whitespace-nowrap border-b border-[color:var(--line-soft)] px-3 py-3", children: /* @__PURE__ */ jsx(Num, { className: pos2 ? "text-[color:var(--up)]" : "text-[color:var(--down)]", children: signedPct(p.pnlPct) }) }),
           /* @__PURE__ */ jsx("td", { className: "whitespace-nowrap border-b border-[color:var(--line-soft)] px-3 py-3", children: /* @__PURE__ */ jsx(Num, { children: p.allocationPct == null ? "—" : `${fmt(p.allocationPct, 1)}%` }) }),
           /* @__PURE__ */ jsx("td", { className: "whitespace-nowrap border-b border-[color:var(--line-soft)] px-3 py-3", children: (() => {
             const st = validStop(v, p.currentPrice), room = stopRoom(p.currentPrice, st);
@@ -3174,7 +3193,7 @@ function ModeNotice({ mode }) {
 var MANUAL_ACTIONS = [{ id: "BUY", label: "קנייה / חיזוק" }, { id: "SELL_PARTIAL", label: "מכירה חלקית" }, { id: "SELL_ALL", label: "מכירת הכל" }];
 var ORDER_KINDS = [{ id: "MARKET", label: "שוק (Market)" }, { id: "LIMIT", label: "לימיט (Limit)" }];
 var ORDER_STATUS = { open: "ממתינה", triggered: "הגיעה למחיר", filled: "בוצעה", cancelled: "בוטלה", failed: "נכשלה" };
-var num = (v) => {
+var num2 = (v) => {
   const x = Number(String(v).replace(/,/g, ""));
   return Number.isFinite(x) ? x : NaN;
 };
@@ -3188,8 +3207,8 @@ function ManualTrade({ position, cash, mode, currency, orders = [], onApplied })
   const [price, setPrice] = useState(startPx);
   const [busy, setBusy] = useState("");
   const [note, setNote] = useState(null);
-  const shares = type === "SELL_ALL" ? held : num(count);
-  const px = num(price);
+  const shares = type === "SELL_ALL" ? held : num2(count);
+  const px = num2(price);
   const amount = shares > 0 && px > 0 ? shares * px : null;
   const tooMany = type !== "BUY" && shares > held + 1e-9;
   const cashAfter = amount == null || cash == null ? null : type === "BUY" ? cash - amount : cash + amount;
@@ -4179,7 +4198,10 @@ function SwingPulseApp() {
   }, []);
   const applyServerState = useCallback((st) => {
     serverSettingsJSON.current = JSON.stringify(st.settings || {});
-    setData((cur) => ({ ...cur, portfolio: st.portfolio ?? null, portfolioIL: st.portfolioIL ?? null, digest: st.digest ?? null, orders: st.orders || [] }));
+    const il = repairILBook(st.portfolioIL ?? null);
+    if (il.changed && !SANDBOX) putState({ portfolioIL: il.book }).catch(() => {
+    });
+    setData((cur) => ({ ...cur, portfolio: st.portfolio ?? null, portfolioIL: il.book ?? null, digest: st.digest ?? null, orders: st.orders || [] }));
     if (st.meta?.fx?.rate) setFx((f) => f.live ? f : { rate: st.meta.fx.rate, live: false });
     if (st.settings) setSettings((s) => ({ ...s, ...st.settings, alertTypes: { ...s.alertTypes, ...st.settings.alertTypes || {} } }));
     if (Array.isArray(st.alerts)) setAlerts(st.alerts);
@@ -4232,6 +4254,12 @@ function SwingPulseApp() {
     if (!isDemo || !synced) return void 0;
     let alive = true;
     demoApi.get().then((d) => {
+      const il = repairILBook(d?.portfolioIL ?? null);
+      if (il.changed) {
+        d = { ...d, portfolioIL: il.book };
+        demoApi.put({ portfolioIL: il.book }).catch(() => {
+        });
+      }
       if (alive) setDemo(d);
     }).catch((e) => {
       if (alive) setDemoState((s) => ({ ...s, error: e.message }));

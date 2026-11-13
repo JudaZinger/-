@@ -8,7 +8,7 @@
    Secrets live in Script Properties (only the owner can read them).
    =================================================================================== */
 
-var GAS_VERSION = '6.2.0';
+var GAS_VERSION = '6.2.1';
 var DEFAULT_MODEL = 'gemini-flash-latest';
 var FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash'];
 var CELL_MAX = 45000;                 // a Sheets cell holds 50,000 characters; keep a margin
@@ -361,9 +361,10 @@ function getQuotes_(tickers) {
       try {
         var j = JSON.parse(res.getContentText().replace(/,\s*}/g, '}'));
         var s = (j.symbols || [])[0] || {};
-        var price = Number(s.close), prev = Number(s.previous);
+        var ta = /\.TA$/i.test(toYahoo(t)), k = ta ? 0.01 : 1;   // Stooq quotes Tel Aviv in agorot too
+        var price = Number(s.close) * k, prev = Number(s.previous) * k;
         if (!(price > 0)) throw new Error('no price');
-        quotes[t] = { symbol: toYahoo(t), source: 'stooq', price: price, prevClose: prev > 0 ? prev : null,
+        quotes[t] = { symbol: toYahoo(t), source: 'stooq', currency: ta ? 'ILS' : null, price: price, prevClose: prev > 0 ? prev : null,
           dayChangePct: prev > 0 ? Math.round((price / prev - 1) * 10000) / 100 : null, sma20: null, sma50: null, high20: null, low20: null, marketTime: null };
       } catch (e) { failed.push({ ticker: t, reason: 'אין מחיר (Yahoo ו-Stooq)' }); }
     });
@@ -1290,6 +1291,7 @@ function toYahoo(ticker) {
   const t = String(ticker || '').trim().toUpperCase();
   if (!t || /\.CVR$|^CVR/.test(t)) return null;
   if (EXCHANGE_SUFFIX.test(t)) return t;            // TEVA.TA, VOD.L, SHOP.TO: Yahoo's own exchange suffix
+  if (/^\d{5,9}$/.test(t)) return `${t}.TA`;         // a TASE security number (funds / ETFs, e.g. 1146125)
   return t.replace(/\./g, '-');                      // BRK.B -> BRK-B (US share classes)
 }
 const EXCHANGE_SUFFIX = /\.(TA|L|TO|V|DE|F|PA|AS|BR|MI|MC|SW|ST|OL|CO|HE|HK|T|KS|SS|SZ|AX|NZ|SA|MX|NS|BO)$/;
@@ -1319,7 +1321,8 @@ function parseChart(json) {
   const prev = lastIsCurrent ? closes.at(-2) : closes.at(-1);
   const last20 = closes.slice(-20);
   // Tel Aviv: Yahoo quotes in agorot (ILA). Everything here is in shekels.
-  const k = m.currency === 'ILA' ? 0.01 : 1;
+  const tase = m.currency === 'ILA' || (/\.TA$/i.test(m.symbol || '') && !m.currency);   // Tel Aviv without a currency: agorot too
+  const k = tase ? 0.01 : 1;
   const sc = v => (Number.isFinite(v) ? v * k : v);
   return {
     price: round(sc(price)),
@@ -1329,7 +1332,7 @@ function parseChart(json) {
     sma50: round(sc(sma(closes, 50))),
     high20: last20.length ? round(sc(Math.max(...last20))) : null,
     low20: last20.length ? round(sc(Math.min(...last20))) : null,
-    currency: m.currency === 'ILA' ? 'ILS' : m.currency || null,
+    currency: tase ? 'ILS' : m.currency || null,
     exchange: m.exchangeName || null,
     marketTime: m.regularMarketTime ? new Date(m.regularMarketTime * 1000).toISOString() : null,
   };
@@ -1943,10 +1946,11 @@ const TASE_SYMBOLS = {
   'אלביט מערכות': 'ESLT.TA', 'אלביט': 'ESLT.TA',
   'בזק': 'BEZQ.TA',
   'כיל': 'ICL.TA', 'איי.סי.אל': 'ICL.TA', 'ICL': 'ICL.TA',
-  'נובה': 'NVMI.TA', 'טאואר': 'TSEM.TA',
+  'נובה': 'NVMI.TA', 'אלביט מערכות בע"מ': 'ESLT.TA', 'טאואר': 'TSEM.TA',
   'עזריאלי': 'AZRG.TA', 'עזריאלי קבוצה': 'AZRG.TA',
   'הפניקס': 'PHOE.TA', 'הראל': 'HARL.TA', 'הראל השקעות': 'HARL.TA',
   'שופרסל': 'SAE.TA', 'שטראוס': 'STRS.TA', 'דלק קבוצה': 'DLEKG.TA',
+  'ארית': 'ARIT.TA', 'ארית תעשיות': 'ARIT.TA', 'ARIT': 'ARIT.TA',
   'אורמת': 'ORA.TA', 'אורמת טכנו': 'ORA.TA',
   'מליסרון': 'MLSR.TA', 'אמות': 'AMOT.TA', 'ביג': 'BIG.TA',
   'שיכון ובינוי': 'SKBN.TA', 'אלוני חץ': 'ALHE.TA',
@@ -1969,25 +1973,50 @@ function taseSymbol({ ticker, companyName, securityNumber } = {}) {
   return n.length >= 5 ? n : t || null;
 }
 
+const num = v => (v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
+const pos = v => num(v) != null && num(v) > 0;
+
 /**
- * Israeli apps show the price per share in agorot (100 agorot = ₪1) but the position value in shekels.
- * When shares × price is ~100× the stated value, the prices are in agorot: divide them by 100.
- * Returns the fixed position and whether it changed.
+ * Israeli bank apps show prices (שער אחרון, שער עלות) in AGOROT and values / P&L (שווי, שינוי מעלות) in SHEKELS.
+ * 1. current price: shares × price ≈ 100 × value → price ÷ 100.
+ * 2. buy price: the unit (as is, or ÷ 100) whose P&L matches the P&L or % on screen; with no P&L on screen,
+ *    the same unit as the current price (one column format), or ÷ 100 when it is 20× the price.
  */
 function normalizeAgorot(p) {
-  const shares = Number(p.shares), value = Number(p.marketValue), price = Number(p.currentPrice);
-  if (!(shares > 0) || !(value > 0) || !(price > 0)) return { position: p, fixed: false };
-  const ratio = (shares * price) / value;
-  if (ratio > 50 && ratio < 200) {
-    const q = { ...p, currentPrice: price / 100 };
-    if (Number(p.avgPrice) > 0) {
-      // the buy price is in the same unit as the current price when it sits near it
-      const avg = Number(p.avgPrice);
-      if (avg / price > 0.2 && avg / price < 5) q.avgPrice = avg / 100;
-    }
-    return { position: q, fixed: true };
+  const shares = num(p.shares), value = num(p.marketValue), pnl = num(p.unrealizedPnl), pct = num(p.unrealizedPnlPct);
+  let price = num(p.currentPrice), avg = num(p.avgPrice), fixed = false, priceInAgorot = false;
+  if (pos(shares) && pos(value) && pos(price)) {
+    const r = (shares * price) / value;
+    if (r > 50 && r < 200) { price /= 100; fixed = priceInAgorot = true; }
   }
-  return { position: p, fixed: false };
+  if (!pos(price) && pos(shares) && pos(value)) price = value / shares;          // in ₪, from the value
+  if (pos(avg) && pos(price)) {
+    const miss = a => (pct != null ? Math.abs((price / a - 1) * 100 - pct)
+      : pnl != null && pos(shares) ? Math.abs(shares * (price - a) - pnl) / Math.max(1, Math.abs(pnl)) : null);
+    const asIs = miss(avg), cut = miss(avg / 100);
+    if (asIs != null ? cut < asIs : priceInAgorot || avg / price > 20) { avg /= 100; fixed = true; }
+  }
+  const r6 = v => (v == null ? v : Math.round(v * 1e6) / 1e6);
+  return { position: { ...p, currentPrice: r6(price) ?? p.currentPrice, avgPrice: r6(avg) ?? p.avgPrice }, fixed };
+}
+
+/**
+ * Repair a stored ₪ book that was imported before the fix: a buy price 20×+ the current price is in agorot.
+ * Recomputes the P&L of the fixed rows. Returns { book, changed }.
+ */
+function repairILBook(book) {
+  if (!book || !Array.isArray(book.positions)) return { book, changed: false };
+  let changed = false;
+  const positions = book.positions.map(p => {
+    const price = num(p.currentPrice), avg = num(p.avgPrice), shares = num(p.shares);
+    if (!pos(price) || !pos(avg) || avg / price <= 20) return p;
+    changed = true;
+    const a = avg / 100;
+    return { ...p, avgPrice: Math.round(a * 1e6) / 1e6,
+      unrealizedPnl: pos(shares) ? Math.round(shares * (price - a) * 100) / 100 : p.unrealizedPnl,
+      unrealizedPnlPct: Math.round((price / a - 1) * 10000) / 100 };
+  });
+  return { book: changed ? { ...book, positions } : book, changed };
 }
 
 /** ₪ per $ from a quotes answer, else the last known, else the fallback. */
@@ -2027,14 +2056,20 @@ function combineBooks(us, il, rate, display = 'ILS') {
   const invested = sum('invested'), cost = sum('cost'), cash = sum('cash');
   const total = invested + cash;
   const pnl = invested - cost;
+  // prices stay in each stock's own currency (they are compared with stops and targets in that currency);
+  // value and P&L are converted, and fxMul converts the cost the same way
   const positions = books.flatMap(([b, m]) => {
     const cur = b.currency || MARKET_CURRENCY[m];
-    const k = v => (v == null ? v : convert(v, cur, display, rate));
-    return b.positions.map(p => ({
-      ...p, market: m, nativeCurrency: cur,
-      currentPrice: k(p.currentPrice), avgPrice: k(p.avgPrice), marketValue: k(p.marketValue),
-      allocationPct: total ? Math.round(((convert(Number(p.marketValue) || 0, cur, display, rate)) / total) * 10000) / 100 : null,
-    }));
+    const mul = convert(1, cur, display, rate);
+    return b.positions.map(p => {
+      const mv = Number(p.marketValue);
+      return {
+        ...p, market: m, nativeCurrency: cur, fxMul: mul,
+        marketValue: Number.isFinite(mv) ? Math.round(mv * mul * 100) / 100 : p.marketValue,
+        unrealizedPnl: p.unrealizedPnl == null ? p.unrealizedPnl : Math.round(Number(p.unrealizedPnl) * mul * 100) / 100,
+        allocationPct: total && Number.isFinite(mv) ? Math.round(((mv * mul) / total) * 10000) / 100 : null,
+      };
+    });
   }).sort((a, b) => (b.marketValue || 0) - (a.marketValue || 0));
   const pct = v => (total ? Math.round((v / total) * 1000) / 10 : 0);
   return {
@@ -2066,7 +2101,9 @@ Extract every holding row into "positions":
 - currentPrice: the last price (שער אחרון / שער נוכחי).
 - marketValue: the holding value in shekels (שווי / שווי נוכחי / שווי בש"ח).
 - unrealizedPnl / unrealizedPnlPct: profit or loss in shekels and in percent (רווח/הפסד, שינוי מעלות).
-IMPORTANT, agorot: Israeli apps usually show share prices in AGOROT (100 agorot = 1 ₪) while values and totals are in SHEKELS. Copy each price exactly as shown, do not convert it; the server checks shares × price against the value and divides by 100 when needed.
+IMPORTANT, agorot: Israeli bank apps (Hapoalim, Leumi, Discount, Mizrahi…) show BOTH share prices — שער אחרון (last price) and שער עלות / שער קנייה משוקלל (buy price) — in AGOROT (100 agorot = 1 ₪), while שווי אחזקה (value) and שינוי מעלות ₪ (P&L) are in SHEKELS. Example: Elbit, quantity 1, value 2,283.60, last price 228,360, buy price 162,610, P&L +657.50 (+40.43%). Copy every number exactly as shown (228360, 162610, 2283.6, 657.5, 40.43). Do NOT convert units yourself: the server checks quantity × price against the value and the P&L, and divides by 100.
+- Always copy unrealizedPnl (שינוי מעלות ₪) and unrealizedPnlPct (% שינוי מעלות) when shown: the server uses them to check the buy price.
+- A fund / ETF without an English symbol (e.g. "קסם ETF (4A) ביטוח 1146125"): ticker = its security number (1146125).
 - Plain numbers only: no currency signs, no thousands separators. A loss is negative. Percentages as percent numbers.
 - totalPortfolioValue: the total holdings value (סה"כ שווי תיק) if shown, else null. cashBalance: cash in shekels (יתרה כספית / מזומן / יתרת עו"ש בתיק) if shown, else null.
 - currency: ILS.
@@ -2117,7 +2154,7 @@ function isTaseOpen(d = new Date()) {
   return mins >= 599 && mins < (day === 'Fri' ? 830 : 1045);
 }
 
-return { MARKETS, MARKET_CURRENCY, FX_SYMBOL, FX_FALLBACK, marketOf, bookKey, TASE_SYMBOLS, taseSymbol, normalizeAgorot, fxRate, convert, combineBooks, tradesByMarket, EXTRACTION_PROMPT_IL, prepareILChunk, booksOf, emptyBook, bothBooksForPrompt, digestInput, isTaseOpen };
+return { MARKETS, MARKET_CURRENCY, FX_SYMBOL, FX_FALLBACK, marketOf, bookKey, TASE_SYMBOLS, taseSymbol, normalizeAgorot, repairILBook, fxRate, convert, combineBooks, tradesByMarket, EXTRACTION_PROMPT_IL, prepareILChunk, booksOf, emptyBook, bothBooksForPrompt, digestInput, isTaseOpen };
 })();
 var MARKETS = __markets.MARKETS;
 var MARKET_CURRENCY = __markets.MARKET_CURRENCY;
@@ -2128,6 +2165,7 @@ var bookKey = __markets.bookKey;
 var TASE_SYMBOLS = __markets.TASE_SYMBOLS;
 var taseSymbol = __markets.taseSymbol;
 var normalizeAgorot = __markets.normalizeAgorot;
+var repairILBook = __markets.repairILBook;
 var fxRate = __markets.fxRate;
 var convert = __markets.convert;
 var combineBooks = __markets.combineBooks;
