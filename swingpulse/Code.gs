@@ -8,11 +8,11 @@
    Secrets live in Script Properties (only the owner can read them).
    =================================================================================== */
 
-var GAS_VERSION = '6.1.0';
+var GAS_VERSION = '6.2.0';
 var DEFAULT_MODEL = 'gemini-flash-latest';
 var FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash'];
 var CELL_MAX = 45000;                 // a Sheets cell holds 50,000 characters; keep a margin
-var STATE_KEYS = ['portfolio', 'digest', 'settings', 'alerts', 'meta', 'orders', 'updatedAt'];
+var STATE_KEYS = ['portfolio', 'portfolioIL', 'digest', 'settings', 'alerts', 'meta', 'orders', 'updatedAt'];
 
 /* ---------- web app ---------- */
 
@@ -32,10 +32,11 @@ var RPC = {
   health: function () { return apiHealth(); },
   getState: function () { return readState_(); },
   putState: function (patch) { return setState_(patch || {}); },
-  quotes: function (tickers) { return getQuotes_(tickers || []); },
+  quotes: function (tickers) { return quotesWithFx_(tickers || []); },
   candles: function (ticker, range) { return getCandles_(ticker, range); },
   digest: function (portfolio, opts) { return JSON.parse(apiDigest(JSON.stringify(portfolio), opts || {})); },
-  extractChunk: function (images, start, total) { return apiExtractChunk(images, start, total); },
+  // opts.il: the Tel Aviv book, so one scan covers both markets
+  extractChunk: function (images, start, total, market) { return apiExtractChunk(images, start, total, market); },
   mergeExtraction: function (chunks, meta) { return JSON.parse(apiMergeExtraction(chunks, meta)); },
   saveSecrets: function (s) { return apiSaveSecrets(s); },
   testTelegram: function () { return apiTestTelegram(); },
@@ -47,6 +48,7 @@ var RPC = {
   putDemo: function (patch) {
     var p = {};
     if (patch && patch.portfolio) p.portfolio = patch.portfolio;
+    if (patch && patch.portfolioIL) p.portfolioIL = patch.portfolioIL;
     if (patch && 'digest' in patch) p.digest = patch.digest;
     setDemo_(p);
     return demoView_();
@@ -180,7 +182,7 @@ function stateSheet_() {
 function readState_() {
   var sh = stateSheet_();
   var values = sh.getDataRange().getValues();
-  var out = { portfolio: null, digest: null, settings: mergeSettings({}), alerts: [], meta: {}, updatedAt: null };
+  var out = { portfolio: null, portfolioIL: null, digest: null, settings: mergeSettings({}), alerts: [], meta: {}, updatedAt: null };
   values.forEach(function (row) {
     var key = row[0];
     if (STATE_KEYS.indexOf(key) < 0) return;
@@ -227,8 +229,8 @@ function setState_(patch) {
     });
     st.updatedAt = new Date().toISOString();
     writeKey_(sh, 'updatedAt', st.updatedAt);
-    if ('portfolio' in patch) writePortfolioSheet_(st.portfolio, st.digest);
-    else if ('digest' in patch) writePortfolioSheet_(st.portfolio, st.digest);
+    if ('portfolio' in patch || 'digest' in patch) writePortfolioSheet_(st.portfolio, st.digest);
+    if ('portfolioIL' in patch || 'digest' in patch) writePortfolioSheet_(st.portfolioIL, st.digest, 'תיק ישראל');
     return st;
   } finally { lock.releaseLock(); }
 }
@@ -242,7 +244,7 @@ function writePortfolioSheet_(portfolio, digest, sheetName) {
   sh.setRightToLeft(true);
   var verdict = {};
   ((digest && digest.positions) || []).forEach(function (v) { verdict[v.ticker] = v; });
-  var rows = [['מניה', 'כמות', 'מחיר קנייה', 'מחיר', 'שווי', 'רווח %', 'שינוי יומי %', '% מהתיק', 'המלצה', 'סטופ', 'יעד']];
+  var rows = [[name.indexOf('ישראל') >= 0 ? 'נייר (₪)' : 'מניה ($)', 'כמות', 'מחיר קנייה', 'מחיר', 'שווי', 'רווח %', 'שינוי יומי %', '% מהתיק', 'המלצה', 'סטופ', 'יעד']];
   portfolio.positions.forEach(function (p) {
     var v = verdict[p.ticker] || {};
     rows.push([p.ticker, p.shares, p.avgPrice, p.currentPrice, p.marketValue, p.unrealizedPnlPct,
@@ -370,6 +372,26 @@ function getQuotes_(tickers) {
 }
 
 /** Daily/weekly candles for the stock chart. */
+/** Quotes plus the live ₪/$ rate (kept in meta.fx so a failed fetch falls back to the last known rate). */
+function quotesWithFx_(tickers) {
+  var r = getQuotes_(tickers.concat([FX_SYMBOL]));
+  var last = (readState_().meta || {}).fx;
+  r.fx = fxRate(r.quotes, last);
+  delete r.quotes[FX_SYMBOL];
+  r.failed = (r.failed || []).filter(function (f) { return f.ticker !== FX_SYMBOL; });
+  return r;
+}
+function allTickers_(h) {
+  return [].concat(((h.portfolio || {}).positions || []), ((h.portfolioIL || {}).positions || [])).map(function (p) { return p.ticker; });
+}
+/** Fresh prices on both books of a holder (state or demo); each book only takes quotes in its own currency. */
+function liveBooks_(h, q) {
+  var out = {};
+  if (h.portfolio) out.portfolio = applyLive_(h.portfolio, q.quotes, q.at);
+  if (h.portfolioIL) out.portfolioIL = applyLive_(h.portfolioIL, q.quotes, q.at);
+  return out;
+}
+
 function getCandles_(ticker, range) {
   var sym = toYahoo(ticker);
   if (!sym) throw apiError_('bad_request', 'לא נסחר');
@@ -431,14 +453,16 @@ function notify_(list, settings) {
 
 /* ---------- digest ---------- */
 
-function runDigest_(portfolioIn, gopts) {
+function runDigest_(portfolioIn, gopts, ilIn) {
   var t0 = Date.now();
-  var portfolio = portfolioIn, liveCount = 0;
+  var books = { portfolio: portfolioIn, portfolioIL: ilIn || null }, liveCount = 0, rate = FX_FALLBACK;
   try {
-    var q = getQuotes_(portfolio.positions.map(function (p) { return p.ticker; }));
+    var q = quotesWithFx_(allTickers_(books));
+    rate = q.fx.rate;
     liveCount = Object.keys(q.quotes).length;
-    if (liveCount) portfolio = applyLive_(portfolio, q.quotes, q.at);
+    if (liveCount) books = Object.assign(books, liveBooks_(books, q));
   } catch (e) { console.warn('digest quotes: ' + e.message); }
+  var portfolio = digestInput(books.portfolio, books.portfolioIL, rate);
   var search = secret_('ENABLE_SEARCH') !== 'false';
   var call = function (withSearch) {
     var req = {
@@ -460,7 +484,7 @@ function runDigest_(portfolioIn, gopts) {
   out.sources = chunks.filter(function (c) { return c.web && c.web.uri && !seen[c.web.uri] && (seen[c.web.uri] = true); })
     .slice(0, 12).map(function (c) { return { title: c.web.title || c.web.uri, url: c.web.uri }; });
   out.meta = { model: r.model, liveData: usedSearch, livePrices: liveCount, ms: Date.now() - t0, at: new Date().toISOString() };
-  return { digest: out, portfolio: portfolio };
+  return { digest: out, portfolio: books.portfolio, portfolioIL: books.portfolioIL };
 }
 
 /* ---------- functions the page calls (google.script.run) ---------- */
@@ -492,15 +516,17 @@ function apiTestTelegram() {
 }
 
 /** One chunk of screenshots ([{mimeType, data(base64)}]) → extraction JSON for that chunk. */
-function apiExtractChunk(images, start, total) {
+function apiExtractChunk(images, start, total, market) {
   var note = '\n(Screenshots ' + (start + 1) + '–' + (start + images.length) + ' of ' + total + '.)';
-  var parts = [{ text: EXTRACTION_PROMPT + note }].concat(images.map(function (img) { return { inlineData: { mimeType: img.mimeType || 'image/jpeg', data: img.data } }; }));
+  var il = market === 'IL';
+  var parts = [{ text: (il ? EXTRACTION_PROMPT_IL : EXTRACTION_PROMPT) + note }].concat(images.map(function (img) { return { inlineData: { mimeType: img.mimeType || 'image/jpeg', data: img.data } }; }));
   var r = geminiGenerate_({ contents: [{ role: 'user', parts: parts }], generationConfig: { responseMimeType: 'application/json', responseJsonSchema: EXTRACTION_SCHEMA } });
-  return r.text;
+  return il ? JSON.stringify(prepareILChunk(parseJSONLoose_(r.text))) : r.text;
 }
 /** All chunk results (JSON strings) → one portfolio. */
 function apiMergeExtraction(chunkJsons, meta) {
   var merged = mergeChunks(chunkJsons.map(function (j) { return JSON.parse(j); }));
+  if (meta && meta.market === 'IL') { merged.currency = 'ILS'; merged.market = 'IL'; }
   merged.meta = Object.assign({}, merged.meta, meta || {}, { model: secret_('GEMINI_MODEL') || DEFAULT_MODEL });
   return JSON.stringify(merged);
 }
@@ -508,19 +534,27 @@ function apiMergeExtraction(chunkJsons, meta) {
 /** Digest. opts: { save, trigger }. With save the digest + alerts are stored and sent to Telegram. */
 function apiDigest(portfolioJson, opts) {
   var pf = JSON.parse(portfolioJson);
-  if (!pf || !pf.positions || !pf.positions.length) throw apiError_('no_positions', 'אין פוזיציות');
-  var res = runDigest_(pf);
+  var il = opts && opts.il && opts.il.positions && opts.il.positions.length ? opts.il : null;
+  if ((!pf || !pf.positions || !pf.positions.length) && !il) throw apiError_('no_positions', 'אין פוזיציות');
+  var res = runDigest_(pf && pf.positions && pf.positions.length ? pf : null, null, il);
   var out = res.digest;
   if (opts && opts.save) {
     var st = readState_();
     var prev = opts.trigger === 'import' ? null : st.digest;
-    var fresh = buildAlerts(prev, out, st.portfolio || pf, st.settings, opts.trigger || 'manual');
+    var fresh = buildAlerts(prev, out, bothBooks_(st.portfolio || pf, st.portfolioIL || il), st.settings, opts.trigger || 'manual');
     var meta = Object.assign({}, st.meta, { lastDigestAt: out.meta.at });
-    setState_({ digest: out, alerts: fresh.concat(st.alerts || []), meta: meta, portfolio: st.portfolio ? applyLiveFrom_(st.portfolio, res.portfolio) : res.portfolio });
+    var patch = { digest: out, alerts: fresh.concat(st.alerts || []), meta: meta };
+    if (res.portfolio) patch.portfolio = st.portfolio ? applyLiveFrom_(st.portfolio, res.portfolio) : res.portfolio;
+    if (res.portfolioIL) patch.portfolioIL = st.portfolioIL ? applyLiveFrom_(st.portfolioIL, res.portfolioIL) : res.portfolioIL;
+    setState_(patch);
     notify_(fresh, st.settings);
     out.newAlerts = fresh;
   }
   return JSON.stringify(out);
+}
+/** One positions list of both books, for alerts that look positions up by ticker. */
+function bothBooks_(us, il) {
+  return { positions: [].concat((us && us.positions) || [], (il && il.positions) || []) };
 }
 /** Keep the stored portfolio (it may hold edits) but take the fresh live prices of the digest run. */
 function applyLiveFrom_(stored, live) {
@@ -555,19 +589,19 @@ function agentTick() {
   var t0 = Date.now();
   try { checkOrders_(); } catch (e) { console.warn('orders: ' + redact_(String(e.message || e))); }
   var st = readState_();
-  if (!st.portfolio || !st.portfolio.positions || !st.portfolio.positions.length) return;
+  if (!allTickers_(st).length) return;
   var now = new Date();
-  var open = isUsMarketOpen(now);
+  var open = isUsMarketOpen(now) || isTaseOpen(now);
   var meta = st.meta || {};
   var lastQ = meta.lastQuotesAt ? new Date(meta.lastQuotesAt).getTime() : 0;
 
   if (open || now.getTime() - lastQ > 60 * 60e3) {
     try {
-      var q = getQuotes_(st.portfolio.positions.map(function (p) { return p.ticker; }));
+      var q = quotesWithFx_(allTickers_(st));
       if (Object.keys(q.quotes).length) {
         st = setState_(function (cur) {
-          if (!cur.portfolio) return null;
-          return { portfolio: applyLive_(cur.portfolio, q.quotes, q.at), meta: Object.assign({}, cur.meta, { lastQuotesAt: q.at }) };
+          if (!cur.portfolio && !cur.portfolioIL) return null;
+          return Object.assign(liveBooks_(cur, q), { meta: Object.assign({}, cur.meta, { lastQuotesAt: q.at, fx: q.fx.live ? q.fx : (cur.meta || {}).fx }) });
         });
         meta = st.meta || {};
       }
@@ -577,7 +611,7 @@ function agentTick() {
   if (open && (st.settings.alertTypes || {}).stop !== false) {
     var stops = [];
     st = setState_(function (cur) {
-      stops = stopAlerts(cur.portfolio, cur.digest, cur.alerts, now);
+      stops = stopAlerts(bothBooks_(cur.portfolio, cur.portfolioIL), cur.digest, cur.alerts, now);
       return stops.length ? { alerts: stops.concat(cur.alerts || []) } : null;
     });
     if (stops.length) notify_(stops, st.settings);
@@ -590,10 +624,10 @@ function agentTick() {
   if (digestDue(st.settings, meta.lastDigestAt, now) && waitOk && secret_('GEMINI_API_KEY')) {
     setState_(function (cur) { return { meta: Object.assign({}, cur.meta, { lastDigestTryAt: now.toISOString(), digestFails: (cur.meta && cur.meta.digestFails || 0) + 1 }) }; });
     try {
-      var res = runDigest_(st.portfolio, { light: true, deadline: t0 + 5 * 60e3 });
+      var res = runDigest_(st.portfolio, { light: true, deadline: t0 + 5 * 60e3 }, st.portfolioIL);
       var fresh = [];
       var cur2 = setState_(function (cur) {
-        fresh = buildAlerts(cur.digest, res.digest, cur.portfolio, cur.settings, 'auto');
+        fresh = buildAlerts(cur.digest, res.digest, bothBooks_(cur.portfolio, cur.portfolioIL), cur.settings, 'auto');
         var m = Object.assign({}, cur.meta, { lastDigestAt: res.digest.meta.at });
         delete m.lastDigestTryAt; delete m.digestFails; delete m.lastDigestError;
         return { digest: res.digest, alerts: fresh.concat(cur.alerts || []), meta: m };
@@ -607,7 +641,7 @@ function agentTick() {
 
 /* ---------- demo mode ("point zero"): a separate 30-day paper portfolio, never touches the real one ---------- */
 
-var DEMO_KEYS = ['portfolio', 'zero', 'digest', 'orders', 'updatedAt'];
+var DEMO_KEYS = ['portfolio', 'portfolioIL', 'zero', 'digest', 'orders', 'updatedAt'];
 var DEMO_HISTORY_HEAD = ['זמן', 'פעולה', 'מניה', 'כמות', 'מחיר', 'סכום', 'רווח ממומש', 'מקור', 'הערה'];
 
 function hiddenSheet_(name) {
@@ -619,7 +653,7 @@ function hiddenSheet_(name) {
 
 function readDemo_() {
   var sh = hiddenSheet_('_demo');
-  var out = { portfolio: null, zero: null, digest: null, updatedAt: null };
+  var out = { portfolio: null, portfolioIL: null, zero: null, digest: null, updatedAt: null };
   if (!sh.getLastRow()) return out;
   sh.getDataRange().getValues().forEach(function (row) {
     if (DEMO_KEYS.indexOf(row[0]) < 0) return;
@@ -645,6 +679,7 @@ function setDemo_(patch) {
     d.updatedAt = new Date().toISOString();
     writeKey_(sh, 'updatedAt', d.updatedAt);
     if ('portfolio' in patch || 'digest' in patch) writePortfolioSheet_(d.portfolio, d.digest, 'תיק_דמו');
+    if ('portfolioIL' in patch || 'digest' in patch) writePortfolioSheet_(d.portfolioIL, d.digest, 'תיק_דמו_ישראל');
     return d;
   } finally { lock.releaseLock(); }
 }
@@ -684,29 +719,37 @@ function demoView_() {
 /** Point zero: copy the real portfolio (with live prices) into the demo and start the history over. */
 function demoReset_() {
   var real = readState_();
-  if (!real.portfolio || !real.portfolio.positions || !real.portfolio.positions.length) throw apiError_('no_positions', 'אין תיק אמיתי להעתיק. קודם מייבאים מבלינק.');
-  var pf = JSON.parse(JSON.stringify(real.portfolio));
+  if (!allTickers_(real).length) throw apiError_('no_positions', 'אין תיק אמיתי להעתיק. קודם מייבאים מבלינק או מהבנק.');
+  var books = JSON.parse(JSON.stringify({ portfolio: real.portfolio, portfolioIL: real.portfolioIL }));
   try {
-    var q = getQuotes_(pf.positions.map(function (p) { return p.ticker; }));
-    if (Object.keys(q.quotes).length) pf = applyLive_(pf, q.quotes, q.at);
+    var q = getQuotes_(allTickers_(books));
+    if (Object.keys(q.quotes).length) books = Object.assign(books, liveBooks_(books, q));
   } catch (e) { console.warn('demo quotes: ' + e.message); }
   var at = new Date().toISOString();
-  var demo = recomputePortfolio({
-    positions: pf.positions.map(function (p) {
-      return { ticker: p.ticker, companyName: p.companyName, shares: p.shares, avgPrice: p.avgPrice, currentPrice: p.currentPrice, live: p.live || null };
-    }),
-    cashBalance: Number(pf.cashBalance) || 0, currency: pf.currency || 'USD', realizedPnl: 0, importedAt: at, liveAt: pf.liveAt || null, liveCount: pf.liveCount || 0
-  });
+  var demo = books.portfolio ? demoBook_(books.portfolio, at, 'USD') : null;
+  var demoIL = books.portfolioIL ? demoBook_(books.portfolioIL, at, 'ILS') : null;
+  var zeroOf = function (b) { return b ? b.positions.map(function (p) { return { ticker: p.ticker, shares: p.shares, avgPrice: p.avgPrice, price: p.currentPrice }; }) : []; };
   var zero = {
-    at: at, total: demo.totalPortfolioValue, cash: demo.cashBalance, realTotal: demo.totalPortfolioValue,
-    positions: demo.positions.map(function (p) { return { ticker: p.ticker, shares: p.shares, avgPrice: p.avgPrice, price: p.currentPrice }; })
+    at: at, total: demo ? demo.totalPortfolioValue : 0, cash: demo ? demo.cashBalance : 0, realTotal: demo ? demo.totalPortfolioValue : 0,
+    totalIL: demoIL ? demoIL.totalPortfolioValue : 0, cashIL: demoIL ? demoIL.cashBalance : 0,
+    positions: zeroOf(demo).concat(zeroOf(demoIL))
   };
+  var count = (demo ? demo.positions.length : 0) + (demoIL ? demoIL.positions.length : 0);
   var sh = demoHistorySheet_();
   sh.clearContents();
   sh.getRange(1, 1, 1, DEMO_HISTORY_HEAD.length).setValues([DEMO_HISTORY_HEAD]);
-  logDemo_([{ at: at, type: 'נקודת אפס', ticker: '', amount: zero.total, source: 'system', note: demo.positions.length + ' מניות הועתקו מהתיק האמיתי' }]);
-  setDemo_({ portfolio: demo, zero: zero, digest: real.digest || null, orders: [] });
+  logDemo_([{ at: at, type: 'נקודת אפס', ticker: '', amount: zero.total, source: 'system', note: count + ' מניות הועתקו מהתיק האמיתי' }]);
+  setDemo_({ portfolio: demo, portfolioIL: demoIL, zero: zero, digest: real.digest || null, orders: [] });
   return demoView_();
+}
+
+function demoBook_(pf, at, currency) {
+  return recomputePortfolio({
+    positions: pf.positions.map(function (p) {
+      return { ticker: p.ticker, companyName: p.companyName, shares: p.shares, avgPrice: p.avgPrice, currentPrice: p.currentPrice, live: p.live || null };
+    }),
+    cashBalance: Number(pf.cashBalance) || 0, currency: pf.currency || currency, realizedPnl: 0, importedAt: at, liveAt: pf.liveAt || null, liveCount: pf.liveCount || 0
+  });
 }
 
 /* ---------- trades: free text → checked trades → applied to the real or the demo portfolio ---------- */
@@ -717,20 +760,39 @@ function strictMode_(mode) {
   throw apiError_('bad_mode', 'חסר מצב (live / demo). שום דבר לא עודכן.');
 }
 
-function portfolioFor_(mode) {
+/** Both books of a mode: { portfolio, portfolioIL }. */
+function holderFor_(mode) {
   if (strictMode_(mode) === 'demo') {
     var d = readDemo_();
-    if (!d.portfolio) throw apiError_('no_demo', 'מצב הדמו עוד לא התחיל.');
-    return d.portfolio;
+    if (!d.zero) throw apiError_('no_demo', 'מצב הדמו עוד לא התחיל.');
+    return d;
   }
-  return readState_().portfolio || { positions: [], cashBalance: 0 };
+  return readState_();
+}
+function portfolioFor_(mode, market) {
+  var h = holderFor_(mode);
+  return h[bookKey(market || 'US')] || emptyBook(market || 'US');
+}
+
+/** Trades go to the book of their market (a .TA symbol → the Tel Aviv book, in ₪). Returns the patch and the merged results. */
+function applyBooks_(h, trades, source) {
+  var by = tradesByMarket(trades), patch = {}, results = [], log = [];
+  MARKETS.forEach(function (m) {
+    if (!by[m].length) return;
+    var key = bookKey(m);
+    var r = applyTrades(h[key] || emptyBook(m), by[m], { source: source });
+    results = results.concat(r.results);
+    log = log.concat(r.log);
+    if (r.log.length) patch[key] = r.portfolio;
+  });
+  return { patch: patch, results: results, log: log };
 }
 
 function parseTrade_(text, mode) {
   if (!String(text || '').trim()) throw apiError_('bad_request', 'ההודעה ריקה');
-  var pf = portfolioFor_(mode);
+  var h = holderFor_(mode);
   var r = geminiGenerate_({
-    contents: [{ role: 'user', parts: [{ text: tradeParsePrompt(text, pf) }] }],
+    contents: [{ role: 'user', parts: [{ text: tradeParsePrompt(text, bothBooksForPrompt(h.portfolio, h.portfolioIL)) }] }],
     generationConfig: { responseMimeType: 'application/json', responseJsonSchema: TRADE_PARSE_SCHEMA }
   }, { json: true });
   var parsed = cleanParsedTrades(r.data);
@@ -740,7 +802,8 @@ function parseTrade_(text, mode) {
     if (!(t.price > 0) && quotes[t.ticker] && quotes[t.ticker].price > 0) { t.price = quotes[t.ticker].price; t.priceSource = 'live'; }
     if (!(t.shares > 0) && t.amount > 0 && t.price > 0 && t.type !== 'SELL_ALL') t.shares = Math.floor(t.amount / t.price * 10000) / 10000;
   });
-  var previews = applyTrades(pf, parsed.trades, {}).results;   // each preview sees the trades before it
+  var previews = applyBooks_(h, parsed.trades, 'chat').results;   // each preview sees the trades before it, in its own book
+  previews.forEach(function (p) { if (p.trade) p.trade.market = marketOf(p.trade.ticker); });
   return { mode: mode, reply: parsed.reply, trades: parsed.trades, previews: previews, model: r.model };
 }
 
@@ -750,22 +813,22 @@ function applyTrades_(trades, mode, source) {
   if (mode === 'demo') {
     var res = null;
     setDemo_(function (d) {
-      if (!d.portfolio) throw apiError_('no_demo', 'מצב הדמו עוד לא התחיל.');
-      res = applyTrades(d.portfolio, trades, { source: source || 'chat' });
+      if (!d.zero) throw apiError_('no_demo', 'מצב הדמו עוד לא התחיל.');
+      res = applyBooks_(d, trades, source || 'chat');
       if (!res.log.length) throw apiError_('trade_failed', res.results.map(function (x) { return x.error; }).filter(Boolean).join(' '));
-      return { portfolio: res.portfolio };
+      return res.patch;
     });
     logDemo_(res.log);
     return { mode: 'demo', results: res.results, log: res.log, demo: demoView_() };
   }
   var out = null;
   var saved = setState_(function (st) {
-    if (!st.portfolio) throw apiError_('no_positions', 'אין תיק אמיתי. קודם מייבאים מבלינק.');
-    out = applyTrades(st.portfolio, trades, { source: source || 'chat' });
+    if (!st.portfolio && !st.portfolioIL) throw apiError_('no_positions', 'אין תיק אמיתי. קודם מייבאים מבלינק או מהבנק.');
+    out = applyBooks_(st, trades, source || 'chat');
     if (!out.log.length) throw apiError_('trade_failed', out.results.map(function (x) { return x.error; }).filter(Boolean).join(' '));
-    return { portfolio: out.portfolio, meta: Object.assign({}, st.meta, { trades: out.log.concat((st.meta && st.meta.trades) || []).slice(0, 100) }) };
+    return Object.assign({}, out.patch, { meta: Object.assign({}, st.meta, { trades: out.log.concat((st.meta && st.meta.trades) || []).slice(0, 100) }) });
   });
-  return { mode: 'live', results: out.results, log: out.log, portfolio: saved.portfolio, updatedAt: saved.updatedAt };
+  return { mode: 'live', results: out.results, log: out.log, portfolio: saved.portfolio, portfolioIL: saved.portfolioIL, updatedAt: saved.updatedAt };
 }
 
 /* ---------- manual trades and limit orders (live and demo keep separate order books) ---------- */
@@ -811,7 +874,7 @@ function placeOrder_(o, mode) {
     r.orders = ordersOf_(mode);
     return r;
   }
-  var pv = previewTrade(portfolioFor_(mode), { type: t.type, ticker: t.ticker, shares: t.shares, price: t.price });
+  var pv = previewTrade(portfolioFor_(mode, marketOf(t.ticker)), { type: t.type, ticker: t.ticker, shares: t.shares, price: t.price });
   if (!pv.ok) throw apiError_('trade_failed', pv.error);
   var order = { id: Utilities.getUuid().slice(0, 8), type: t.type, ticker: t.ticker, shares: pv.trade.shares, limit: t.price, status: 'open', at: new Date().toISOString() };
   return { mode: mode, order: order, orders: saveOrders_(mode, function (l) { return l.concat([order]); }) };
@@ -873,7 +936,7 @@ function analysts_(ticker, mode, refresh) {
   } catch (e) { cache = null; }
   var st = readState_();
   var demo = mode === 'demo' ? readDemo_() : null;
-  var pf = (demo ? demo.portfolio : st.portfolio) || { positions: [] };
+  var pf = (demo || st)[bookKey(marketOf(ticker))] || { positions: [] };
   var digest = (demo && demo.digest) || st.digest;
   var position = (pf.positions || []).filter(function (p) { return String(p.ticker).toUpperCase() === ticker; })[0] || null;
   var ind = indicators(getCandles_(ticker, '1y').candles);
@@ -1158,14 +1221,14 @@ function digestPrompt(portfolio, { search }) {
     cashBalance: num(portfolio.cashBalance),
     totalPortfolioValue: num(portfolio.totalPortfolioValue),
     positions: (portfolio.positions || []).map(p => ({
-      ticker: p.ticker, shares: num(p.shares), avgPrice: num(p.avgPrice), currentPrice: num(p.currentPrice),
+      ticker: p.ticker, ...(p.currency && p.currency !== (portfolio.currency || 'USD') ? { currency: p.currency } : {}), shares: num(p.shares), avgPrice: num(p.avgPrice), currentPrice: num(p.currentPrice),
       marketValue: num(p.marketValue), unrealizedPnlPct: num(p.unrealizedPnlPct), allocationPct: num(p.allocationPct),
       ...(p.live ? { dayChangePct: num(p.live.dayChangePct), sma20: num(p.live.sma20), sma50: num(p.live.sma50), high20: num(p.live.high20), low20: num(p.live.low20), priceAsOf: p.live.marketTime } : {})
     }))
   };
   return `You are a swing-trading assistant for a trader holding positions 2-4 weeks (not day trading, not buy-and-hold). Write every text field in Hebrew, short and concrete.
 Portfolio (JSON): ${JSON.stringify(slim)}
-Positions that include sma20/sma50/high20/low20/dayChangePct carry LIVE market data fetched just now: base trend and stop levels on those numbers (price above/below each moving average, distance from the 20-day high/low). Do not invent other prices.
+${portfolio.fxRate ? `Positions with currency ILS trade in Tel Aviv (symbol .TA), their prices are in shekels; cash and totals are in ${portfolio.currency || 'USD'} (1 USD = ${portfolio.fxRate} ILS). Give stops and targets in each position's own currency.\n` : ''}Positions that include sma20/sma50/high20/low20/dayChangePct carry LIVE market data fetched just now: base trend and stop levels on those numbers (price above/below each moving average, distance from the 20-day high/low). Do not invent other prices.
 
 For EVERY position return exactly one entry with:
 - action: ADD (add on strength), HOLD, TRIM (reduce part), TAKE_PROFIT (exit most/all at a gain), CUT_LOSS (exit at a loss).
@@ -1176,7 +1239,7 @@ For EVERY position return exactly one entry with:
 ${search
     ? '- Use Google Search for each ticker\'s recent price action, trend vs. 20/50-day moving averages, and any catalyst in the next 2-4 weeks (earnings, guidance). In dataNote say what you found and how recent it is.'
     : '- You have NO live market data. Base everything only on the numbers above, and say so in dataNote. Do not invent prices, moving averages or news.'}
-Also: marketSummary (overall US market stance for swing traders${search ? ', from current data' : ', or say it is unknown without live data'}), and portfolioNotes about concentration (any position over 25% of the portfolio), cash level and total risk to stops.
+Also: marketSummary (overall ${portfolio.fxRate ? 'US and Tel Aviv (TA-35 / TA-125)' : 'US'} market stance for swing traders${search ? ', from current data' : ', or say it is unknown without live data'}), and portfolioNotes about concentration (any position over 25% of the portfolio), cash level and total risk to stops.
 Rules: never invent numbers you did not see or look up. This is decision support, not a guarantee — no promises of returns.`;
 }
 
@@ -1660,14 +1723,15 @@ const TRADE_PARSE_SCHEMA = {
 };
 
 function tradeParsePrompt(text, portfolio) {
-  const held = ((portfolio && portfolio.positions) || []).map(p => `${p.ticker} (${p.companyName || p.ticker}, ${p.shares} מניות, ממוצע ${p.avgPrice})`).join('; ') || 'התיק ריק';
+  const held = ((portfolio && portfolio.positions) || []).map(p => `${p.ticker} (${p.companyName || p.ticker}, ${p.shares} מניות, ממוצע ${p.avgPrice}${/\.TA$/.test(p.ticker) ? ' ₪' : ''})`).join('; ') || 'התיק ריק';
   return `You turn a person's message about their own stock trades (written in Hebrew, sometimes with English tickers) into structured trades.
 Their portfolio now: ${held}.
 Types: BUY = bought / added shares; SELL_PARTIAL = sold part of a position; SELL_ALL = sold the whole position ("מכרתי הכל", "יצאתי מ").
 Rules:
-- One item per stock and action. Use the ticker symbol in uppercase; map company names (also in Hebrew) to their US ticker.
+- One item per stock and action. Use the ticker symbol in uppercase. Two markets: US stocks (plain ticker, USD) and Tel Aviv stocks (symbol ending in .TA, e.g. LUMI.TA, POLI.TA, TEVA.TA, NICE.TA, ENLT.TA, ESLT.TA, prices in ₪).
+- An Israeli company named in Hebrew, or a trade said to be in Tel Aviv ("בבורסה בתל אביב", "בת\"א", "בשקלים"), gets its .TA symbol. If the portfolio already holds the stock, use the exact symbol it holds. Otherwise a company name maps to its US ticker.
 - shares: the number of shares said. For SELL_ALL put null. If they gave a money amount instead of shares, put it in amount and shares null.
-- price: the price per share they said, in USD. If they did not say a price, null (the server will use the live price).
+- price: the price per share they said, in the stock's own currency: USD for US stocks, shekels (₪, not agorot) for .TA stocks; if they said agorot (אגורות) divide by 100. If they did not say a price, null (the server will use the live price).
 - Never invent numbers. If the message is not about a trade, return an empty trades list.
 - reply: one short natural Hebrew sentence that says what you understood or what is missing.
 Message: """${String(text || '').slice(0, 600)}"""`;
@@ -1797,8 +1861,9 @@ function analystPrompt(ctx, { search = false } = {}) {
   const { ticker, position, ind, portfolioTotal, cash, verdict, market } = ctx;
   const held = position && position.shares > 0;
   const stopRoom = verdict && verdict.trailingStop && ind && ind.price ? r2((ind.price - verdict.trailingStop) / ind.price * 100) : null;
+  const tase = /\.TA$/.test(ticker);
   return `You are four swing-trading analysts looking at ${ticker} for one private investor (holding period: days to a few weeks).
-Data (USD):
+${tase ? 'This stock trades on the Tel Aviv Stock Exchange (TASE). Prices are in shekels (ILS). Measure it against the TA-35 and TA-125 indexes, the shekel/dollar rate and Israeli news, not the US market.\n' : ''}Data (${tase ? 'ILS' : 'USD'}):
 - Indicators: ${JSON.stringify(ind)}
 - Position: ${held ? JSON.stringify({ shares: position.shares, avgPrice: position.avgPrice, value: position.marketValue, pnlPct: position.unrealizedPnlPct, portfolioPct: position.allocationPct }) : 'not held'}
 - Portfolio: total ${r2(portfolioTotal)}, cash ${r2(cash)}
@@ -1807,7 +1872,7 @@ Data (USD):
 Answer as four separate views:
 - technical: price vs SMA20/50/200, RSI14, MACD and crossovers, 20-day range and breakouts, volume.
 - risk: position size (% of portfolio; over 25% is concentrated), distance to stop, loss so far, cash level. Stricter than the others.
-- market: the broader trend and sentiment for this stock and its sector${search ? ', using Google Search for recent news, earnings dates and analyst views' : ' (no live news available: say so)'}.
+- market: the broader trend and sentiment for this stock and its sector${tase ? ' on the Tel Aviv exchange (vs TA-35 / TA-125)' : ''}${search ? ', using Google Search for recent news, earnings dates and analyst views' : ' (no live news available: say so)'}.
 - synthesis: weigh the three and give the final call.
 Actions: ${held ? 'ADD (buy more), HOLD, TRIM (sell part), TAKE_PROFIT (sell all at a gain), CUT_LOSS (sell all at a loss)' : 'BUY (new entry) or HOLD (wait)'}.
 For each: action, summary (2-4 short sentences in natural Hebrew, no English except tickers and indicator names), stop and target prices (null if none; a stop must be below the price, a target above it), confidence.
@@ -1844,4 +1909,234 @@ var indicators = __analysts.indicators;
 var ANALYST_SCHEMA = __analysts.ANALYST_SCHEMA;
 var analystPrompt = __analysts.analystPrompt;
 var validateAnalysts = __analysts.validateAnalysts;
+
+/* ---------------- lib/markets.js ---------------- */
+var __markets = (function () {
+// Two markets side by side: the US book (Blink, $) and the Tel Aviv book (Israeli bank / broker, ₪).
+// Each market is its own portfolio object, so its cash, totals and P&L stay in its own currency.
+// Pure functions, shared by the frontend and both servers.
+
+const MARKETS = ['US', 'IL'];
+const MARKET_CURRENCY = { US: 'USD', IL: 'ILS' };
+const FX_SYMBOL = 'USDILS=X';
+const FX_FALLBACK = 3.7;                 // ₪ per $, used only until a live rate arrives
+
+/** Which market a ticker trades on: Tel Aviv symbols end in .TA, or are a TASE security number. */
+function marketOf(ticker) {
+  const t = String(ticker || '').trim().toUpperCase();
+  return /\.TA$/.test(t) || /^\d{5,9}$/.test(t) ? 'IL' : 'US';
+}
+
+/** The portfolio key a market lives under, in the state and in the demo. */
+const bookKey = market => (market === 'IL' ? 'portfolioIL' : 'portfolio');
+
+/** Common Tel Aviv names → Yahoo/TradingView symbols (Hebrew and English spellings an app or bank may show). */
+const TASE_SYMBOLS = {
+  'לאומי': 'LUMI.TA', 'בנק לאומי': 'LUMI.TA', 'LEUMI': 'LUMI.TA',
+  'פועלים': 'POLI.TA', 'בנק הפועלים': 'POLI.TA', 'HAPOALIM': 'POLI.TA',
+  'דיסקונט': 'DSCT.TA', 'בנק דיסקונט': 'DSCT.TA',
+  'מזרחי טפחות': 'MZTF.TA', 'מזרחי': 'MZTF.TA',
+  'הבינלאומי': 'FIBI.TA', 'בינלאומי': 'FIBI.TA',
+  'טבע': 'TEVA.TA', 'TEVA': 'TEVA.TA',
+  'נייס': 'NICE.TA', 'NICE': 'NICE.TA',
+  'אנלייט': 'ENLT.TA', 'אנלייט אנרגיה': 'ENLT.TA',
+  'אלביט מערכות': 'ESLT.TA', 'אלביט': 'ESLT.TA',
+  'בזק': 'BEZQ.TA',
+  'כיל': 'ICL.TA', 'איי.סי.אל': 'ICL.TA', 'ICL': 'ICL.TA',
+  'נובה': 'NVMI.TA', 'טאואר': 'TSEM.TA',
+  'עזריאלי': 'AZRG.TA', 'עזריאלי קבוצה': 'AZRG.TA',
+  'הפניקס': 'PHOE.TA', 'הראל': 'HARL.TA', 'הראל השקעות': 'HARL.TA',
+  'שופרסל': 'SAE.TA', 'שטראוס': 'STRS.TA', 'דלק קבוצה': 'DLEKG.TA',
+  'אורמת': 'ORA.TA', 'אורמת טכנו': 'ORA.TA',
+  'מליסרון': 'MLSR.TA', 'אמות': 'AMOT.TA', 'ביג': 'BIG.TA',
+  'שיכון ובינוי': 'SKBN.TA', 'אלוני חץ': 'ALHE.TA',
+  'מנורה מבטחים': 'MMHD.TA', 'כלל עסקי ביטוח': 'CLIS.TA',
+  'אל על': 'ELAL.TA', 'פז': 'PZOL.TA', 'פז נפט': 'PZOL.TA',
+  'ת"א 35': 'TA35.TA', 'ת"א-35': 'TA35.TA', 'תא 35': 'TA35.TA',
+  'ת"א 125': 'TA125.TA', 'ת"א-125': 'TA125.TA',
+};
+
+/** Best symbol for an Israeli holding: a symbol the model gave, else the name looked up, else the security number. */
+function taseSymbol({ ticker, companyName, securityNumber } = {}) {
+  const t = String(ticker || '').trim().toUpperCase().replace(/^TASE:/, '');
+  if (/^[A-Z][A-Z0-9]{0,9}\.TA$/.test(t)) return t;
+  if (/^[A-Z][A-Z0-9]{0,9}$/.test(t) && t.length >= 2) return `${t}.TA`;
+  const name = String(companyName || '').replace(/\s+/g, ' ').trim();
+  if (TASE_SYMBOLS[name]) return TASE_SYMBOLS[name];
+  const hit = Object.keys(TASE_SYMBOLS).filter(k => k.length >= 3 && name.includes(k)).sort((a, b) => b.length - a.length)[0];
+  if (hit) return TASE_SYMBOLS[hit];
+  const n = String(securityNumber || ticker || '').replace(/\D/g, '');
+  return n.length >= 5 ? n : t || null;
+}
+
+/**
+ * Israeli apps show the price per share in agorot (100 agorot = ₪1) but the position value in shekels.
+ * When shares × price is ~100× the stated value, the prices are in agorot: divide them by 100.
+ * Returns the fixed position and whether it changed.
+ */
+function normalizeAgorot(p) {
+  const shares = Number(p.shares), value = Number(p.marketValue), price = Number(p.currentPrice);
+  if (!(shares > 0) || !(value > 0) || !(price > 0)) return { position: p, fixed: false };
+  const ratio = (shares * price) / value;
+  if (ratio > 50 && ratio < 200) {
+    const q = { ...p, currentPrice: price / 100 };
+    if (Number(p.avgPrice) > 0) {
+      // the buy price is in the same unit as the current price when it sits near it
+      const avg = Number(p.avgPrice);
+      if (avg / price > 0.2 && avg / price < 5) q.avgPrice = avg / 100;
+    }
+    return { position: q, fixed: true };
+  }
+  return { position: p, fixed: false };
+}
+
+/** ₪ per $ from a quotes answer, else the last known, else the fallback. */
+function fxRate(quotes, last) {
+  const q = quotes && quotes[FX_SYMBOL];
+  if (q && q.price > 2 && q.price < 6) return { rate: q.price, at: new Date().toISOString(), live: true };
+  if (last && last.rate > 2 && last.rate < 6) return { ...last, live: false };
+  return { rate: FX_FALLBACK, at: null, live: false };
+}
+
+/** Convert an amount between $ and ₪. */
+function convert(amount, from, to, rate) {
+  const a = Number(amount);
+  if (!Number.isFinite(a) || from === to) return a;
+  if (from === 'USD' && to === 'ILS') return a * rate;
+  if (from === 'ILS' && to === 'USD') return a / rate;
+  return a;
+}
+
+/**
+ * One consolidated view of both books in a display currency.
+ * Each position keeps its native market and currency, its numbers are converted.
+ */
+function combineBooks(us, il, rate, display = 'ILS') {
+  const books = [[us, 'US'], [il, 'IL']].filter(([b]) => b && Array.isArray(b.positions));
+  const totalsOf = (b, m) => {
+    const cur = b.currency || MARKET_CURRENCY[m];
+    const invested = b.positions.reduce((a, p) => a + (Number(p.marketValue) || 0), 0);
+    const cost = b.positions.reduce((a, p) => a + (Number(p.shares) || 0) * (Number(p.avgPrice) || 0), 0);
+    const cash = Number(b.cashBalance) || 0;
+    const k = v => convert(v, cur, display, rate);
+    return { invested: k(invested), cost: k(cost), cash: k(cash) };
+  };
+  const parts = {};
+  books.forEach(([b, m]) => { parts[m] = totalsOf(b, m); });
+  const sum = key => Object.values(parts).reduce((a, x) => a + x[key], 0);
+  const invested = sum('invested'), cost = sum('cost'), cash = sum('cash');
+  const total = invested + cash;
+  const pnl = invested - cost;
+  const positions = books.flatMap(([b, m]) => {
+    const cur = b.currency || MARKET_CURRENCY[m];
+    const k = v => (v == null ? v : convert(v, cur, display, rate));
+    return b.positions.map(p => ({
+      ...p, market: m, nativeCurrency: cur,
+      currentPrice: k(p.currentPrice), avgPrice: k(p.avgPrice), marketValue: k(p.marketValue),
+      allocationPct: total ? Math.round(((convert(Number(p.marketValue) || 0, cur, display, rate)) / total) * 10000) / 100 : null,
+    }));
+  }).sort((a, b) => (b.marketValue || 0) - (a.marketValue || 0));
+  const pct = v => (total ? Math.round((v / total) * 1000) / 10 : 0);
+  return {
+    combined: true, currency: display, fxRate: rate, positions,
+    cashBalance: Math.round(cash * 100) / 100,
+    totalPortfolioValue: Math.round(total * 100) / 100,
+    totalPnl: Math.round(pnl * 100) / 100,
+    totalPnlPct: cost ? Math.round((pnl / cost) * 10000) / 100 : null,
+    split: { US: pct(parts.US ? parts.US.invested : 0), IL: pct(parts.IL ? parts.IL.invested : 0), cash: pct(cash) },
+    liveAt: [us && us.liveAt, il && il.liveAt].filter(Boolean).sort().pop() || null,
+    liveCount: books.reduce((a, [b]) => a + (b.liveCount || 0), 0),
+  };
+}
+
+/** Split trades by market, keeping their order inside each market. */
+function tradesByMarket(trades) {
+  const out = { US: [], IL: [] };
+  (trades || []).forEach(t => out[marketOf(t && t.ticker)].push(t));
+  return out;
+}
+
+/** The Gemini Vision prompt for Israeli bank / TASE broker screenshots (same JSON shape as the Blink prompt). */
+const EXTRACTION_PROMPT_IL = `You are reading screenshots from an Israeli bank or broker app (Bank Leumi, Hapoalim, Discount, Mizrahi, IBI, Meitav, Excellence and similar) showing one person's holdings on the Tel Aviv Stock Exchange (בורסת תל אביב). The screens are in Hebrew, right to left.
+Extract every holding row into "positions":
+- ticker: the TASE English symbol if it is shown (e.g. LUMI, POLI, TEVA); otherwise the security number (מספר נייר / מס' ני"ע, 6-8 digits); otherwise the Hebrew security name exactly as written.
+- companyName: the Hebrew security name (שם נייר), as written.
+- shares: quantity (כמות / יתרה / כמות יחידות).
+- avgPrice: the cost basis per share (שער עלות / שער קנייה ממוצע / מחיר ממוצע).
+- currentPrice: the last price (שער אחרון / שער נוכחי).
+- marketValue: the holding value in shekels (שווי / שווי נוכחי / שווי בש"ח).
+- unrealizedPnl / unrealizedPnlPct: profit or loss in shekels and in percent (רווח/הפסד, שינוי מעלות).
+IMPORTANT, agorot: Israeli apps usually show share prices in AGOROT (100 agorot = 1 ₪) while values and totals are in SHEKELS. Copy each price exactly as shown, do not convert it; the server checks shares × price against the value and divides by 100 when needed.
+- Plain numbers only: no currency signs, no thousands separators. A loss is negative. Percentages as percent numbers.
+- totalPortfolioValue: the total holdings value (סה"כ שווי תיק) if shown, else null. cashBalance: cash in shekels (יתרה כספית / מזומן / יתרת עו"ש בתיק) if shown, else null.
+- currency: ILS.
+- warnings: real problems only (a cut-off row, an unreadable number, screenshots that disagree), each once, in short natural Hebrew. Do not warn about missing prices, cash or totals. Empty list if nothing is wrong.`;
+
+/** Fix one Israeli chunk before it is merged: prices in agorot → shekels, names / numbers → .TA symbols. */
+function prepareILChunk(chunk) {
+  if (!chunk || typeof chunk !== 'object') return chunk;
+  const notes = [];
+  const positions = (Array.isArray(chunk.positions) ? chunk.positions : []).map(raw => {
+    const { position, fixed } = normalizeAgorot(raw);
+    const sym = taseSymbol({ ticker: raw.ticker, companyName: raw.companyName });
+    if (fixed) notes.push(`${raw.companyName || raw.ticker}: המחירים הופיעו באגורות והומרו לשקלים.`);
+    if (sym && sym !== raw.ticker && !/\.TA$/.test(sym) && !/^\d+$/.test(sym)) notes.push(`${raw.companyName || raw.ticker}: לא נמצא סימול בורסה, נשמר לפי השם.`);
+    return { ...position, ticker: sym || raw.ticker, currency: 'ILS' };
+  });
+  return { ...chunk, currency: 'ILS', positions, warnings: [...(chunk.warnings || []), ...notes] };
+}
+
+/** Both books of one mode (live state or demo), as { US, IL }. */
+const booksOf = holder => ({ US: (holder && holder.portfolio) || null, IL: (holder && holder.portfolioIL) || null });
+
+/** An empty book for a market (first Israeli trade before any import). */
+const emptyBook = market => ({ positions: [], cashBalance: 0, currency: MARKET_CURRENCY[market], realizedPnl: 0 });
+
+/** Both books as one list for the AI (trade parsing sees every holding, each in its own currency). */
+function bothBooksForPrompt(us, il) {
+  return { positions: [...((us && us.positions) || []), ...((il && il.positions) || []).map(p => ({ ...p, currency: 'ILS' }))] };
+}
+
+/** The digest sees both books: native prices per position, totals converted to the US book's currency. */
+function digestInput(us, il, rate) {
+  if (!il || !il.positions || !il.positions.length) return us;
+  if (!us || !us.positions || !us.positions.length) return il;
+  const c = combineBooks(us, il, rate, 'USD');
+  const ilPos = il.positions.map(p => ({ ...p, currency: 'ILS', allocationPct: c.positions.find(x => x.ticker === p.ticker)?.allocationPct ?? null }));
+  const usPos = us.positions.map(p => ({ ...p, allocationPct: c.positions.find(x => x.ticker === p.ticker)?.allocationPct ?? null }));
+  return { ...us, currency: 'USD', fxRate: rate, positions: [...usPos, ...ilPos], cashBalance: c.cashBalance, totalPortfolioValue: c.totalPortfolioValue };
+}
+
+/** Tel Aviv trading hours (Israel time): Mon–Thu 09:59–17:25, Fri 09:59–13:50 (since 2026 TASE trades Mon–Fri). Holidays not modelled. */
+function isTaseOpen(d = new Date()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Jerusalem', weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false })
+    .formatToParts(d).map(x => [x.type, x.value]));
+  const mins = (Number(parts.hour) % 24) * 60 + Number(parts.minute);
+  const day = parts.weekday;
+  if (day === 'Sat' || day === 'Sun') return false;
+  return mins >= 599 && mins < (day === 'Fri' ? 830 : 1045);
+}
+
+return { MARKETS, MARKET_CURRENCY, FX_SYMBOL, FX_FALLBACK, marketOf, bookKey, TASE_SYMBOLS, taseSymbol, normalizeAgorot, fxRate, convert, combineBooks, tradesByMarket, EXTRACTION_PROMPT_IL, prepareILChunk, booksOf, emptyBook, bothBooksForPrompt, digestInput, isTaseOpen };
+})();
+var MARKETS = __markets.MARKETS;
+var MARKET_CURRENCY = __markets.MARKET_CURRENCY;
+var FX_SYMBOL = __markets.FX_SYMBOL;
+var FX_FALLBACK = __markets.FX_FALLBACK;
+var marketOf = __markets.marketOf;
+var bookKey = __markets.bookKey;
+var TASE_SYMBOLS = __markets.TASE_SYMBOLS;
+var taseSymbol = __markets.taseSymbol;
+var normalizeAgorot = __markets.normalizeAgorot;
+var fxRate = __markets.fxRate;
+var convert = __markets.convert;
+var combineBooks = __markets.combineBooks;
+var tradesByMarket = __markets.tradesByMarket;
+var EXTRACTION_PROMPT_IL = __markets.EXTRACTION_PROMPT_IL;
+var prepareILChunk = __markets.prepareILChunk;
+var booksOf = __markets.booksOf;
+var emptyBook = __markets.emptyBook;
+var bothBooksForPrompt = __markets.bothBooksForPrompt;
+var digestInput = __markets.digestInput;
+var isTaseOpen = __markets.isTaseOpen;
 

@@ -112,10 +112,75 @@ function applyTrades(portfolio, trades, { at = (/* @__PURE__ */ new Date()).toIS
   return { portfolio: recomputePortfolio(pf), results, log };
 }
 
+// lib/markets.js
+var MARKET_CURRENCY = { US: "USD", IL: "ILS" };
+var FX_FALLBACK = 3.7;
+function marketOf(ticker) {
+  const t = String(ticker || "").trim().toUpperCase();
+  return /\.TA$/.test(t) || /^\d{5,9}$/.test(t) ? "IL" : "US";
+}
+var bookKey = (market) => market === "IL" ? "portfolioIL" : "portfolio";
+function convert(amount, from, to, rate) {
+  const a = Number(amount);
+  if (!Number.isFinite(a) || from === to) return a;
+  if (from === "USD" && to === "ILS") return a * rate;
+  if (from === "ILS" && to === "USD") return a / rate;
+  return a;
+}
+function combineBooks(us, il, rate, display = "ILS") {
+  const books = [[us, "US"], [il, "IL"]].filter(([b]) => b && Array.isArray(b.positions));
+  const totalsOf = (b, m) => {
+    const cur = b.currency || MARKET_CURRENCY[m];
+    const invested2 = b.positions.reduce((a, p) => a + (Number(p.marketValue) || 0), 0);
+    const cost2 = b.positions.reduce((a, p) => a + (Number(p.shares) || 0) * (Number(p.avgPrice) || 0), 0);
+    const cash2 = Number(b.cashBalance) || 0;
+    const k = (v) => convert(v, cur, display, rate);
+    return { invested: k(invested2), cost: k(cost2), cash: k(cash2) };
+  };
+  const parts = {};
+  books.forEach(([b, m]) => {
+    parts[m] = totalsOf(b, m);
+  });
+  const sum = (key) => Object.values(parts).reduce((a, x) => a + x[key], 0);
+  const invested = sum("invested"), cost = sum("cost"), cash = sum("cash");
+  const total = invested + cash;
+  const pnl = invested - cost;
+  const positions = books.flatMap(([b, m]) => {
+    const cur = b.currency || MARKET_CURRENCY[m];
+    const mul = convert(1, cur, display, rate);
+    return b.positions.map((p) => {
+      const mv = Number(p.marketValue);
+      return {
+        ...p,
+        market: m,
+        nativeCurrency: cur,
+        fxMul: mul,
+        marketValue: Number.isFinite(mv) ? Math.round(mv * mul * 100) / 100 : p.marketValue,
+        unrealizedPnl: p.unrealizedPnl == null ? p.unrealizedPnl : Math.round(Number(p.unrealizedPnl) * mul * 100) / 100,
+        allocationPct: total && Number.isFinite(mv) ? Math.round(mv * mul / total * 1e4) / 100 : null
+      };
+    });
+  }).sort((a, b) => (b.marketValue || 0) - (a.marketValue || 0));
+  const pct = (v) => total ? Math.round(v / total * 1e3) / 10 : 0;
+  return {
+    combined: true,
+    currency: display,
+    fxRate: rate,
+    positions,
+    cashBalance: Math.round(cash * 100) / 100,
+    totalPortfolioValue: Math.round(total * 100) / 100,
+    totalPnl: Math.round(pnl * 100) / 100,
+    totalPnlPct: cost ? Math.round(pnl / cost * 1e4) / 100 : null,
+    split: { US: pct(parts.US ? parts.US.invested : 0), IL: pct(parts.IL ? parts.IL.invested : 0), cash: pct(cash) },
+    liveAt: [us && us.liveAt, il && il.liveAt].filter(Boolean).sort().pop() || null,
+    liveCount: books.reduce((a, [b]) => a + (b.liveCount || 0), 0)
+  };
+}
+
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.1.0";
+var APP_VERSION = "6.2.0";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -178,9 +243,9 @@ var EDGE_CLASSES = {
   red: "border-r-[#ff453a]",
   gray: "border-r-[color:var(--line)]"
 };
-function extractPortfolio(files, { onUpload } = {}) {
-  if (GAS) return gasExtract(files, { onUpload });
-  if (REMOTE) return remoteExtract(files, { onUpload });
+function extractPortfolio(files, { onUpload, market = "US" } = {}) {
+  if (GAS) return gasExtract(files, { onUpload, market });
+  if (REMOTE) return remoteExtract(files, { onUpload, market });
   return new Promise((resolve, reject) => {
     const fd = new FormData();
     files.forEach((f, i) => fd.append("images", f, f.name || `shot-${i + 1}.jpg`));
@@ -201,9 +266,9 @@ function extractPortfolio(files, { onUpload } = {}) {
     xhr.send(fd);
   });
 }
-async function fetchSwingDigest(portfolio, { signal, save = false, trigger } = {}) {
-  if (GAS) return gasJSON("apiDigest", JSON.stringify(portfolio), { save, trigger });
-  if (REMOTE) return rpc("digest", portfolio, { save, trigger });
+async function fetchSwingDigest(portfolio, { signal, save = false, trigger, il = null } = {}) {
+  if (GAS) return gasJSON("apiDigest", JSON.stringify(portfolio), { save, trigger, il });
+  if (REMOTE) return rpc("digest", portfolio, { save, trigger, il });
   const r = await fetch(DIGEST_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -553,7 +618,7 @@ function leaveSandbox() {
   }
   window.location.reload();
 }
-async function remoteExtract(files, { onUpload } = {}) {
+async function remoteExtract(files, { onUpload, market = "US" } = {}) {
   const CHUNK = 6, PARALLEL = 2;
   const chunks = [];
   for (let i = 0; i < files.length; i += CHUNK) chunks.push(files.slice(i, i + CHUNK));
@@ -567,7 +632,7 @@ async function remoteExtract(files, { onUpload } = {}) {
       const images = [];
       for (const f of chunks[i]) images.push({ mimeType: f.type || "image/jpeg", data: await toBase64(f) });
       try {
-        results[i] = { ok: true, json: await rpc("extractChunk", images, start, files.length) };
+        results[i] = { ok: true, json: await rpc("extractChunk", images, start, files.length, market) };
       } catch (e) {
         results[i] = { ok: false, error: e, screenshots: [start + 1, start + chunks[i].length] };
       }
@@ -579,6 +644,7 @@ async function remoteExtract(files, { onUpload } = {}) {
   const ok = results.filter((r) => r.ok);
   if (!ok.length) throw results[0].error;
   const merged = await rpc("mergeExtraction", ok.map((r) => r.json), {
+    market,
     screenshots: files.length,
     chunks: chunks.length,
     ms: Date.now() - t0,
@@ -641,7 +707,7 @@ var toBase64 = (file) => new Promise((res, rej) => {
   r.onerror = () => rej(r.error);
   r.readAsDataURL(file);
 });
-async function gasExtract(files, { onUpload } = {}) {
+async function gasExtract(files, { onUpload, market = "US" } = {}) {
   const CHUNK = 6, PARALLEL = 2;
   const chunks = [];
   for (let i = 0; i < files.length; i += CHUNK) chunks.push(files.slice(i, i + CHUNK));
@@ -655,7 +721,7 @@ async function gasExtract(files, { onUpload } = {}) {
       const images = [];
       for (const f of chunks[i]) images.push({ mimeType: f.type || "image/jpeg", data: await toBase64(f) });
       try {
-        results[i] = { ok: true, json: await gasCall("apiExtractChunk", images, start, files.length) };
+        results[i] = { ok: true, json: await gasCall("apiExtractChunk", images, start, files.length, market) };
       } catch (e) {
         results[i] = { ok: false, error: e, screenshots: [start + 1, start + chunks[i].length] };
       }
@@ -667,6 +733,7 @@ async function gasExtract(files, { onUpload } = {}) {
   const ok = results.filter((r) => r.ok);
   if (!ok.length) throw results[0].error;
   const merged = await gasJSON("apiMergeExtraction", ok.map((r) => r.json), {
+    market,
     screenshots: files.length,
     chunks: chunks.length,
     ms: Date.now() - t0,
@@ -894,7 +961,7 @@ function stopRoom(price, stop) {
 function enrichPosition(p) {
   const shares = p.shares ?? null;
   const value = p.marketValue ?? (shares != null && p.currentPrice != null ? shares * p.currentPrice : null);
-  const cost = shares != null && p.avgPrice != null ? shares * p.avgPrice : null;
+  const cost = shares != null && p.avgPrice != null ? shares * p.avgPrice * (p.fxMul || 1) : null;
   const pnl = value != null && cost != null ? value - cost : null;
   const pnlPct = p.unrealizedPnlPct ?? (cost ? (value / cost - 1) * 100 : null);
   return { ...p, value, cost, pnl, pnlPct };
@@ -1380,7 +1447,7 @@ function useDialog(open = true) {
   }, [open]);
   return ref;
 }
-function ImportModal({ open, onClose, onExtracted, serverOk, hasPortfolio, fromDemo }) {
+function ImportModal({ open, onClose, onExtracted, serverOk, hasPortfolio, fromDemo, initialMarket = "US" }) {
   const dialogRef = useDialog(open);
   const [files, setFiles] = useState([]);
   const [phase, setPhase] = useState("idle");
@@ -1389,6 +1456,11 @@ function ImportModal({ open, onClose, onExtracted, serverOk, hasPortfolio, fromD
   const [error, setError] = useState("");
   const [dragging, setDragging] = useState(false);
   const [mergeMode, setMergeMode] = useState(false);
+  const [market, setMarket] = useState(initialMarket);
+  useEffect(() => {
+    if (open) setMarket(initialMarket);
+  }, [open, initialMarket]);
+  const hasBook = typeof hasPortfolio === "object" ? !!hasPortfolio?.[market] : !!hasPortfolio;
   const busy = phase !== "idle";
   const previews = useMemo(() => files.map((f) => URL.createObjectURL(f)), [files]);
   useEffect(() => () => previews.forEach((u) => URL.revokeObjectURL(u)), [previews]);
@@ -1429,12 +1501,13 @@ function ImportModal({ open, onClose, onExtracted, serverOk, hasPortfolio, fromD
       setPhase("uploading");
       setProgress(0);
       const json = await extractPortfolio(small, {
+        market,
         onUpload: (p) => {
           setProgress(p);
           if (p >= 1) setPhase("reading");
         }
       });
-      onExtracted(json, { merge: mergeMode && hasPortfolio });
+      onExtracted(json, { merge: mergeMode && hasBook, market });
       onClose();
     } catch (e) {
       setPhase("idle");
@@ -1470,7 +1543,7 @@ function ImportModal({ open, onClose, onExtracted, serverOk, hasPortfolio, fromD
           className: "sp-sheet flex max-h-[92vh] max-h-[92dvh] w-full max-w-xl flex-col rounded-t-[28px] pb-[env(safe-area-inset-bottom)] outline-none border border-[color:var(--line)] bg-[color:var(--card)] text-[color:var(--fg)] sm:rounded-2xl",
           children: [
             /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-3 border-b border-[color:var(--line)] px-5 py-4", children: [
-              /* @__PURE__ */ jsx("h2", { id: "import-title", className: "font-semibold", children: "ייבוא מבלינק" }),
+              /* @__PURE__ */ jsx("h2", { id: "import-title", className: "font-semibold", children: "ייבוא תיק מצילומי מסך" }),
               /* @__PURE__ */ jsx("span", { className: "text-xs text-[color:var(--fg-3)]", children: "מנוע Gemini" }),
               /* @__PURE__ */ jsx(
                 "button",
@@ -1508,6 +1581,24 @@ function ImportModal({ open, onClose, onExtracted, serverOk, hasPortfolio, fromD
                   }
                 ) })
               ] }) : /* @__PURE__ */ jsxs(Fragment, { children: [
+                /* @__PURE__ */ jsx("div", { role: "radiogroup", "aria-label": "מאיזה חשבון הצילומים", className: "grid gap-2 sm:grid-cols-2", children: [["US", "🇺🇸", "צילום מסך ארה״ב", "בלינק / ברוקר זר · $"], ["IL", "🇮🇱", "צילום מסך ישראל", "חשבון בנק / בורסת ת״א · ₪"]].map(([id, flag, title, sub]) => /* @__PURE__ */ jsxs(
+                  "button",
+                  {
+                    type: "button",
+                    role: "radio",
+                    "aria-checked": market === id,
+                    onClick: () => setMarket(id),
+                    className: `flex items-center gap-3 rounded-2xl border px-3 py-2.5 text-right transition-colors [touch-action:manipulation] ${market === id ? "border-[#0a84ff] bg-[color:var(--accent-bg)]" : "border-[color:var(--line)] bg-[color:var(--inset)] hover:border-[color:var(--line-2)]"}`,
+                    children: [
+                      /* @__PURE__ */ jsx("span", { className: "text-xl", "aria-hidden": "true", children: flag }),
+                      /* @__PURE__ */ jsxs("span", { className: "flex min-w-0 flex-col", children: [
+                        /* @__PURE__ */ jsx("b", { className: "text-sm", children: title }),
+                        /* @__PURE__ */ jsx("span", { className: "text-xs text-[color:var(--fg-3)]", children: sub })
+                      ] })
+                    ]
+                  },
+                  id
+                )) }),
                 /* @__PURE__ */ jsxs(
                   "label",
                   {
@@ -1540,7 +1631,7 @@ function ImportModal({ open, onClose, onExtracted, serverOk, hasPortfolio, fromD
                         }
                       ),
                       /* @__PURE__ */ jsx(Icon, { name: "upload", className: "h-7 w-7 text-[color:var(--accent)]" }),
-                      /* @__PURE__ */ jsx("b", { className: "text-base", children: "בחר את כל צילומי המסך של בלינק" }),
+                      /* @__PURE__ */ jsx("b", { className: "text-base", children: market === "IL" ? "בחר את צילומי המסך של תיק ההשקעות בבנק" : "בחר את כל צילומי המסך של בלינק" }),
                       /* @__PURE__ */ jsx("span", { className: "text-xs text-[color:var(--fg-3)]", children: "אפשר לסמן את כולם יחד בגלריה · במחשב גם לגרור לכאן" })
                     ]
                   }
@@ -1567,11 +1658,15 @@ function ImportModal({ open, onClose, onExtracted, serverOk, hasPortfolio, fromD
                     }
                   )
                 ] }, u)) }),
-                hasPortfolio && /* @__PURE__ */ jsxs("label", { className: "flex cursor-pointer items-center gap-3 rounded-xl border border-[color:var(--line)] bg-[color:var(--inset)] px-3 py-2.5 text-sm", children: [
+                hasBook && /* @__PURE__ */ jsxs("label", { className: "flex cursor-pointer items-center gap-3 rounded-xl border border-[color:var(--line)] bg-[color:var(--inset)] px-3 py-2.5 text-sm", children: [
                   /* @__PURE__ */ jsx("input", { type: "checkbox", checked: mergeMode, onChange: (e) => setMergeMode(e.target.checked), className: "h-5 w-5 accent-[#0a84ff]" }),
                   /* @__PURE__ */ jsxs("span", { children: [
                     /* @__PURE__ */ jsx("b", { children: "הוסף לתיק הקיים" }),
-                    /* @__PURE__ */ jsx("span", { className: "block text-xs text-[color:var(--fg-3)]", children: "לצילומים שלא פוענחו בפעם הקודמת. כבוי = התיק מוחלף בתוצאה החדשה." })
+                    /* @__PURE__ */ jsxs("span", { className: "block text-xs text-[color:var(--fg-3)]", children: [
+                      "לצילומים שלא פוענחו בפעם הקודמת. כבוי = ",
+                      market === "IL" ? "התיק הישראלי" : "התיק האמריקאי",
+                      " מוחלף בתוצאה החדשה."
+                    ] })
                   ] })
                 ] }),
                 error && /* @__PURE__ */ jsxs("div", { className: "flex gap-2 text-sm text-[color:var(--down)]", children: [
@@ -1883,7 +1978,7 @@ function TodayPlan({ rows, digest, digestState, verdictOf, onOpen, onRun, canRun
     openGroup && /* @__PURE__ */ jsx(PlanSheet, { group: openGroup, doneNow, onToggle: toggle, onOpen, onClose: () => setOpenKind(null) })
   ] });
 }
-function DashboardTab({ portfolio, rows, stats, digest, digestState, verdictOf, full, setFull, onImport, onOpen, onRun, canRun, isDemo = false }) {
+function DashboardTab({ portfolio, rows, stats, digest, digestState, verdictOf, full, setFull, onImport, onOpen, onRun, canRun, isDemo = false, showMarket = false }) {
   const cur = portfolio.currency || "USD";
   const notes = cleanNotes([
     ...(portfolio.meta?.failedChunks || []).map((f) => `צילומים ${f.screenshots?.[0]}–${f.screenshots?.[1]} לא פוענחו — העלו אותם שוב עם "הוסף לתיק הקיים"`),
@@ -1992,6 +2087,7 @@ function DashboardTab({ portfolio, rows, stats, digest, digestState, verdictOf, 
               /* @__PURE__ */ jsxs("div", { className: "flex items-start gap-2", children: [
                 /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
                   /* @__PURE__ */ jsx("b", { dir: "ltr", className: "text-xl", children: p.ticker }),
+                  showMarket && /* @__PURE__ */ jsx(MarketBadge, { p }),
                   /* @__PURE__ */ jsxs("div", { className: "truncate text-xs text-[color:var(--fg-3)]", children: [
                     p.companyName,
                     " · ",
@@ -2074,6 +2170,7 @@ var TABLE_COLUMNS = [
 ];
 var TV_EXCHANGE = { NMS: "NASDAQ", NGM: "NASDAQ", NCM: "NASDAQ", NAS: "NASDAQ", NYQ: "NYSE", NYS: "NYSE", PCX: "AMEX", ASE: "AMEX", BTS: "CBOE", TLV: "TASE" };
 function tvSymbol(ticker, exchange) {
+  if (/\.TA$/i.test(String(ticker))) return `TASE:${String(ticker).toUpperCase().replace(/\.TA$/, "")}`;
   const t = String(ticker || "").toUpperCase().replace(/\./g, "-").replace(/-CVR$/, "");
   const ex = TV_EXCHANGE[exchange];
   return ex ? `${ex}:${t.replace(/-/g, ".")}` : t.replace(/-/g, ".");
@@ -2246,7 +2343,7 @@ function Metric({ label, value, tone }) {
 }
 function StockSheet({ position, verdict, currency, onClose, mode = "live", demoStats = null, onDemoApplied, cash = null, orders = [] }) {
   const dialogRef = useDialog(true);
-  const [view, setView] = useState("tv");
+  const [view, setView] = useState(() => /^\d+$/.test(String(position?.ticker || "")) ? "levels" : "tv");
   const [closing, setClosing] = useState(false);
   const close = useCallback(() => {
     setClosing(true);
@@ -2317,7 +2414,7 @@ function StockSheet({ position, verdict, currency, onClose, mode = "live", demoS
                 /* @__PURE__ */ jsxs("span", { className: "min-w-0 truncate text-xs text-[color:var(--fg-3)]", children: [
                   /* @__PURE__ */ jsxs("span", { dir: "ltr", children: [
                     p.ticker,
-                    exchange ? ` · ${exchange}` : ""
+                    marketOf(p.ticker) === "IL" ? " · TASE · ₪" : exchange ? ` · ${exchange}` : ""
                   ] }),
                   company ? /* @__PURE__ */ jsxs("span", { children: [
                     " · ",
@@ -2382,7 +2479,7 @@ function StockSheet({ position, verdict, currency, onClose, mode = "live", demoS
     }
   );
 }
-function TableTab({ portfolio, rows, stats, verdictOf, digestState, sort, setSort, onOpen }) {
+function TableTab({ portfolio, rows, stats, verdictOf, digestState, sort, setSort, onOpen, showMarket = false }) {
   const cur = portfolio.currency || "USD";
   const sorted = useMemo(() => {
     const val = (p, k) => {
@@ -2432,7 +2529,10 @@ function TableTab({ portfolio, rows, stats, verdictOf, digestState, sort, setSor
         const v = verdictOf(p.ticker);
         const pos = (p.pnl ?? 0) >= 0;
         return /* @__PURE__ */ jsxs("tr", { onClick: () => onOpen?.(p.ticker), className: "cursor-pointer hover:bg-[color:var(--tint)]", children: [
-          /* @__PURE__ */ jsx("td", { className: "sticky right-0 z-[1] whitespace-nowrap border-b border-[color:var(--line-soft)] bg-[color:var(--card)] px-3 py-3", children: /* @__PURE__ */ jsx("b", { dir: "ltr", children: p.ticker }) }),
+          /* @__PURE__ */ jsx("td", { className: "sticky right-0 z-[1] whitespace-nowrap border-b border-[color:var(--line-soft)] bg-[color:var(--card)] px-3 py-3", children: /* @__PURE__ */ jsxs("span", { className: "flex items-center gap-1.5", children: [
+            /* @__PURE__ */ jsx("b", { dir: "ltr", children: p.ticker }),
+            showMarket && /* @__PURE__ */ jsx(MarketBadge, { p })
+          ] }) }),
           /* @__PURE__ */ jsx("td", { className: "max-w-[180px] truncate border-b border-[color:var(--line-soft)] px-3 py-3 text-[color:var(--fg-2)]", children: p.companyName }),
           /* @__PURE__ */ jsx("td", { className: "whitespace-nowrap border-b border-[color:var(--line-soft)] px-3 py-3", children: /* @__PURE__ */ jsx(Num, { children: qty(p.shares) }) }),
           /* @__PURE__ */ jsx("td", { className: "whitespace-nowrap border-b border-[color:var(--line-soft)] px-3 py-3", children: /* @__PURE__ */ jsx(Num, { children: fmt(p.avgPrice) }) }),
@@ -2959,6 +3059,103 @@ var demoApi = {
   cancel: async (id, mode) => rpc("cancelOrder", id, requireMode(mode)),
   fill: async (id, mode, price) => rpc("fillOrder", id, requireMode(mode), price)
 };
+var LS_MARKET = "swingpulse.market";
+var LS_DISPLAY_CUR = "swingpulse.displayCur";
+var LS_FX = "swingpulse.fx";
+var MARKET_OPTIONS = [
+  { id: "ALL", label: "🌐 הכל", sub: "מאוחד" },
+  { id: "US", label: '🇺🇸 ארה"ב', sub: "$" },
+  { id: "IL", label: "🇮🇱 ישראל", sub: "₪" }
+];
+function MarketBadge({ p }) {
+  const il = marketOf(p.ticker) === "IL";
+  const ex = !il && p.live?.exchange ? TV_EXCHANGE[p.live.exchange] || "US" : "US";
+  return /* @__PURE__ */ jsx("span", { className: "inline-flex flex-none items-center gap-1 rounded-md border border-[color:var(--line)] bg-[color:var(--inset)] px-1.5 py-px text-[10px] font-semibold leading-4 text-[color:var(--fg-3)]", children: il ? /* @__PURE__ */ jsx(Fragment, { children: "₪ · ת״א" }) : /* @__PURE__ */ jsxs("span", { dir: "ltr", children: [
+    "$ · ",
+    ex
+  ] }) });
+}
+function MarketSwitcher({ market, setMarket }) {
+  return /* @__PURE__ */ jsx(
+    Segmented,
+    {
+      ariaLabel: "שוק",
+      value: market,
+      onChange: setMarket,
+      options: MARKET_OPTIONS,
+      className: "w-full rounded-2xl border border-[color:var(--line)] bg-[color:var(--inset)] p-1 sm:max-w-md",
+      itemClass: "flex flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded-xl px-2 py-2 text-sm font-medium [touch-action:manipulation]",
+      render: (o) => /* @__PURE__ */ jsxs(Fragment, { children: [
+        o.label,
+        " ",
+        /* @__PURE__ */ jsxs("span", { className: "text-xs opacity-70", children: [
+          "(",
+          o.sub,
+          ")"
+        ] })
+      ] })
+    }
+  );
+}
+function UnifiedCard({ combined: c, displayCur, setDisplayCur, fx }) {
+  const up = (c.totalPnl ?? 0) >= 0;
+  const seg = [["US", c.split.US, "#0a84ff", "ארה״ב"], ["IL", c.split.IL, "#30d158", "ישראל"], ["cash", c.split.cash, "#8e8e93", "מזומן"]];
+  return /* @__PURE__ */ jsxs("section", { className: "flex flex-col gap-4 rounded-3xl border border-[color:var(--line)] bg-[color:var(--card)] p-5", children: [
+    /* @__PURE__ */ jsxs("div", { className: "flex items-start justify-between gap-3", children: [
+      /* @__PURE__ */ jsxs("div", { className: "flex min-w-0 flex-col gap-1", children: [
+        /* @__PURE__ */ jsx("span", { className: "text-sm text-[color:var(--fg-3)]", children: "שווי נקי כולל · שני השווקים" }),
+        /* @__PURE__ */ jsx("b", { className: "text-3xl font-bold tracking-tight", children: /* @__PURE__ */ jsx(Num, { children: money(c.totalPortfolioValue, displayCur) }) }),
+        /* @__PURE__ */ jsxs("span", { className: "text-sm font-semibold", style: { color: up ? "var(--up)" : "var(--down)" }, children: [
+          /* @__PURE__ */ jsx(Num, { children: signedMoney(c.totalPnl, displayCur) }),
+          " ",
+          /* @__PURE__ */ jsxs(Num, { children: [
+            "(",
+            signedPct(c.totalPnlPct),
+            ")"
+          ] })
+        ] })
+      ] }),
+      /* @__PURE__ */ jsx(
+        Segmented,
+        {
+          ariaLabel: "מטבע תצוגה",
+          value: displayCur,
+          onChange: setDisplayCur,
+          options: [{ id: "ILS", label: "₪" }, { id: "USD", label: "$" }],
+          className: "flex-none rounded-xl border border-[color:var(--line)] bg-[color:var(--inset)] p-1",
+          itemClass: "min-w-10 rounded-lg px-3 py-1.5 text-sm font-bold"
+        }
+      )
+    ] }),
+    /* @__PURE__ */ jsx(
+      "div",
+      {
+        className: "flex h-2.5 gap-0.5 overflow-hidden rounded-full bg-[color:var(--inset)]",
+        role: "img",
+        "aria-label": `חלוקה: ארה״ב ${c.split.US}%, ישראל ${c.split.IL}%, מזומן ${c.split.cash}%`,
+        children: seg.map(([k, v, color]) => v > 0 ? /* @__PURE__ */ jsx("span", { className: "h-full transition-[width] duration-500", style: { width: `${v}%`, background: color } }, k) : null)
+      }
+    ),
+    /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-[color:var(--fg-3)]", children: [
+      seg.map(([k, v, color, label]) => /* @__PURE__ */ jsxs("span", { className: "flex items-center gap-1.5", children: [
+        /* @__PURE__ */ jsx("span", { className: "h-2 w-2 rounded-full", style: { background: color } }),
+        label,
+        " ",
+        /* @__PURE__ */ jsx("b", { className: "text-[color:var(--fg-2)]", children: /* @__PURE__ */ jsxs(Num, { children: [
+          fmt(v, 1),
+          "%"
+        ] }) })
+      ] }, k)),
+      /* @__PURE__ */ jsxs("span", { className: "ms-auto", title: fx.live ? "שער חי" : "שער משוער, יתעדכן כשיגיע שער חי", children: [
+        /* @__PURE__ */ jsxs(Num, { children: [
+          "$1 = ₪",
+          fmt(fx.rate, 3)
+        ] }),
+        fx.live ? "" : " · משוער"
+      ] })
+    ] })
+  ] });
+}
 function ModeNotice({ mode }) {
   const live = mode === "live";
   return /* @__PURE__ */ jsxs(
@@ -3163,7 +3360,7 @@ function portfolioStats(pf) {
 function tradeQuestion(t) {
   const n2 = Number(t.shares);
   const count = n2 === 1 ? "מניה אחת של" : `${qty(n2)} מניות`;
-  const px = money(t.price, "USD", 2);
+  const px = money(t.price, MARKET_CURRENCY[marketOf(t.ticker)], 2);
   if (t.type === "SELL_ALL") return `לאשר מכירת כל המניות של ${t.ticker} (${qty(n2)}) ב-${px}?`;
   return `לאשר ${t.type === "BUY" ? "קניית" : "מכירת"} ${count} ${t.ticker} ב-${px}?`;
 }
@@ -3367,6 +3564,7 @@ function TradePreview({ p, mode }) {
     return /* @__PURE__ */ jsx("li", { className: "rounded-2xl px-3 py-2.5 text-sm", style: { background: "var(--down-bg)", color: "var(--down)" }, children: p.error });
   }
   const t = p.trade;
+  const tc = MARKET_CURRENCY[marketOf(t.ticker)];
   const line = (label, value, color) => /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-between gap-3 text-sm", children: [
     /* @__PURE__ */ jsx("span", { className: "text-[color:var(--fg-3)]", children: label }),
     /* @__PURE__ */ jsx("span", { dir: "ltr", className: "sp-num font-semibold", style: color ? { color: `var(--${color})` } : void 0, children: value })
@@ -3376,9 +3574,9 @@ function TradePreview({ p, mode }) {
     /* @__PURE__ */ jsxs("div", { className: "flex flex-col gap-1", children: [
       line("כמות", `${qty(p.before.shares)} → ${qty(p.after.shares)}`),
       t.type === "BUY" && line("מחיר ממוצע", `${p.before.avgPrice != null ? fmt(p.before.avgPrice) : "—"} → ${fmt(p.after.avgPrice)}`),
-      line("סכום העסקה", money(p.amount, "USD", 2)),
-      line("מזומן", `${money(p.cashBefore, "USD", 2)} → ${money(p.cashAfter, "USD", 2)}`),
-      t.type !== "BUY" && line("רווח ממומש", signedMoney(p.realized, "USD"), p.realized >= 0 ? "up" : "down")
+      line("סכום העסקה", money(p.amount, tc, 2)),
+      line(tc === "ILS" ? "מזומן בתיק הישראלי" : "מזומן", `${money(p.cashBefore, tc, 2)} → ${money(p.cashAfter, tc, 2)}`),
+      t.type !== "BUY" && line("רווח ממומש", signedMoney(p.realized, tc), p.realized >= 0 ? "up" : "down")
     ] }),
     p.warning && /* @__PURE__ */ jsx("span", { className: "text-xs text-[color:var(--warn)]", children: p.warning }),
     t.priceSource === "live" && /* @__PURE__ */ jsx("span", { className: "text-xs text-[color:var(--fg-3)]", children: "לא צוין מחיר, נלקח המחיר החי." }),
@@ -3893,8 +4091,33 @@ function SwingPulseApp() {
   dataRef.current = data;
   settingsRef.current = settings;
   const { portfolio, digest } = data;
+  const portfolioIL = data.portfolioIL || null;
   const isDemo = REMOTE && (SANDBOX || mode === "demo");
-  const viewPf = isDemo ? demo?.portfolio || null : portfolio;
+  const [market, setMarketRaw] = useState(() => ["ALL", "US", "IL"].includes(lsGet(LS_MARKET)) ? lsGet(LS_MARKET) : "ALL");
+  const setMarket = useCallback((m) => {
+    setMarketRaw(m);
+    try {
+      localStorage.setItem(LS_MARKET, m);
+    } catch {
+    }
+  }, []);
+  const [displayCur, setDisplayCurRaw] = useState(() => lsGet(LS_DISPLAY_CUR) === "ILS" ? "ILS" : "USD");
+  const setDisplayCur = useCallback((c) => {
+    setDisplayCurRaw(c);
+    try {
+      localStorage.setItem(LS_DISPLAY_CUR, c);
+    } catch {
+    }
+  }, []);
+  const [fx, setFx] = useState(() => loadJSON(LS_FX, { rate: FX_FALLBACK, live: false }));
+  useEffect(() => {
+    saveJSON(LS_FX, fx);
+  }, [fx]);
+  const usPf = isDemo ? demo?.portfolio || null : portfolio;
+  const ilPf = isDemo ? demo?.portfolioIL || null : portfolioIL;
+  const hasIL = !!(portfolioIL?.positions?.length || demo?.portfolioIL?.positions?.length);
+  const combined = useMemo(() => usPf || ilPf ? combineBooks(usPf, ilPf, fx.rate, displayCur) : null, [usPf, ilPf, fx.rate, displayCur]);
+  const viewPf = market === "US" ? usPf : market === "IL" ? ilPf : combined;
   const viewDigest = isDemo ? demo?.digest || null : digest;
   useEffect(() => {
     if (REMOTE && typeof navigator !== "undefined" && "serviceWorker" in navigator && signedIn() && !needLogin) swReady().catch(() => {
@@ -3956,7 +4179,8 @@ function SwingPulseApp() {
   }, []);
   const applyServerState = useCallback((st) => {
     serverSettingsJSON.current = JSON.stringify(st.settings || {});
-    setData((cur) => ({ ...cur, portfolio: st.portfolio ?? null, digest: st.digest ?? null, orders: st.orders || [] }));
+    setData((cur) => ({ ...cur, portfolio: st.portfolio ?? null, portfolioIL: st.portfolioIL ?? null, digest: st.digest ?? null, orders: st.orders || [] }));
+    if (st.meta?.fx?.rate) setFx((f) => f.live ? f : { rate: st.meta.fx.rate, live: false });
     if (st.settings) setSettings((s) => ({ ...s, ...st.settings, alertTypes: { ...s.alertTypes, ...st.settings.alertTypes || {} } }));
     if (Array.isArray(st.alerts)) setAlerts(st.alerts);
   }, []);
@@ -4027,11 +4251,11 @@ function SwingPulseApp() {
     }
   }
   const runDemoDigest = useCallback(async () => {
-    const pf = demoRef.current?.portfolio;
-    if (!pf?.positions?.length) return;
+    const pf = demoRef.current?.portfolio, il = demoRef.current?.portfolioIL;
+    if (!pf?.positions?.length && !il?.positions?.length) return;
     setDigestState({ busy: true, error: "" });
     try {
-      const d = await fetchSwingDigest(pf, { save: false, trigger: "manual" });
+      const d = await fetchSwingDigest(pf || { positions: [] }, { save: false, trigger: "manual", il: il?.positions?.length ? il : null });
       delete d.newAlerts;
       setDemo(await demoApi.put({ digest: d }));
       setDigestState({ busy: false, error: "" });
@@ -4047,7 +4271,7 @@ function SwingPulseApp() {
       return;
     }
     if (r.mode !== "live") return;
-    setData((cur) => ({ ...cur, ...r.portfolio ? { portfolio: r.portfolio } : {}, ...r.orders ? { orders: r.orders } : {} }));
+    setData((cur) => ({ ...cur, ...r.portfolio ? { portfolio: r.portfolio } : {}, ...r.portfolioIL ? { portfolioIL: r.portfolioIL } : {}, ...r.orders ? { orders: r.orders } : {} }));
   }
   useEffect(() => {
     if (!synced) return void 0;
@@ -4060,18 +4284,22 @@ function SwingPulseApp() {
     }, 600);
     return () => clearTimeout(t);
   }, [settings, synced]);
-  const tickerKey = (portfolio?.positions || []).map((p) => p.ticker).join(",");
+  const tickersOf = (h) => [...h?.portfolio?.positions || [], ...h?.portfolioIL?.positions || []].map((p) => p.ticker);
+  const tickerKey = tickersOf(data).join(",");
   const refreshLive = useCallback(async () => {
-    const pf = dataRef.current.portfolio;
-    if (!pf?.positions?.length) return;
+    const tickers = tickersOf(dataRef.current);
+    if (!tickers.length) return;
     setLive((l) => ({ ...l, busy: true }));
     try {
-      const j = await fetchQuotes(pf.positions.map((p) => p.ticker));
-      setData((cur) => cur.portfolio ? { ...cur, portfolio: applyLiveQuotes(cur.portfolio, j.quotes || {}, j.at || (/* @__PURE__ */ new Date()).toISOString()) } : cur);
+      const j = await fetchQuotes(tickers);
+      const at = j.at || (/* @__PURE__ */ new Date()).toISOString();
+      const live2 = (book) => book ? applyLiveQuotes(book, j.quotes || {}, at) : book;
+      if (j.fx?.rate) setFx(j.fx);
+      setData((cur) => ({ ...cur, portfolio: live2(cur.portfolio), portfolioIL: live2(cur.portfolioIL || null) }));
       setLive({ busy: false, error: "", failed: j.failed || [] });
       const d = demoRef.current;
-      if (d?.portfolio?.positions?.length) {
-        const extra = d.portfolio.positions.map((p) => p.ticker).filter((t) => !(j.quotes || {})[String(t).toUpperCase()]);
+      if (tickersOf(d).length) {
+        const extra = tickersOf(d).filter((t) => !(j.quotes || {})[String(t).toUpperCase()]);
         let quotes = j.quotes || {};
         if (extra.length) {
           try {
@@ -4079,7 +4307,8 @@ function SwingPulseApp() {
           } catch {
           }
         }
-        setDemo((cur) => cur && cur.portfolio ? { ...cur, portfolio: applyLiveQuotes(cur.portfolio, quotes, j.at || (/* @__PURE__ */ new Date()).toISOString()) } : cur);
+        const dl = (book) => book ? applyLiveQuotes(book, quotes, at) : book;
+        setDemo((cur) => cur ? { ...cur, portfolio: dl(cur.portfolio), portfolioIL: dl(cur.portfolioIL || null) } : cur);
       }
     } catch (e) {
       setLive((l) => ({ ...l, busy: false, error: e.code === "http_404" && !REMOTE ? "השרת ישן — הפעילו מחדש את start.bat" : "לא הצלחתי למשוך מחירים חיים" }));
@@ -4115,18 +4344,20 @@ function SwingPulseApp() {
       }
     });
   }, []);
-  const runDigest = useCallback(async (trigger = "manual", pfOverride = null) => {
-    const pf = pfOverride || dataRef.current.portfolio;
-    if (!pf?.positions?.length) return;
+  const runDigest = useCallback(async (trigger = "manual", override = null) => {
+    const pf = override ? override.us : dataRef.current.portfolio;
+    const il = override ? override.il : dataRef.current.portfolioIL;
+    if (!pf?.positions?.length && !il?.positions?.length) return;
+    const pfOverride = override;
     if (abortRef.current) abortRef.current.abort();
     const ctl = new AbortController();
     abortRef.current = ctl;
     setDigestState({ busy: true, error: "" });
     try {
       const save = syncedRef.current;
-      const d = await fetchSwingDigest(pf, { signal: ctl.signal, save, trigger });
+      const d = await fetchSwingDigest(pf || { positions: [] }, { signal: ctl.signal, save, trigger, il: il?.positions?.length ? il : null });
       const prev = pfOverride ? null : dataRef.current.digest;
-      const fresh = save ? d.newAlerts || [] : buildAlerts(prev, d, pf, settingsRef.current, trigger);
+      const fresh = save ? d.newAlerts || [] : buildAlerts(prev, d, { positions: [...pf?.positions || [], ...il?.positions || []] }, settingsRef.current, trigger);
       delete d.newAlerts;
       setData((cur) => ({ ...cur, digest: d }));
       if (fresh.length) {
@@ -4145,7 +4376,7 @@ function SwingPulseApp() {
     }
   }, [notify]);
   useEffect(() => {
-    if (!nextRun || !portfolio || !serverOk || digestState.busy || health?.agent) return;
+    if (!nextRun || !(portfolio || portfolioIL) || !serverOk || digestState.busy || health?.agent) return;
     if (now < nextRun.getTime()) return;
     const s = settingsRef.current;
     if (s.marketHoursOnly && s.frequency !== "eod" && !isUsMarketOpen(new Date(now))) {
@@ -4153,21 +4384,36 @@ function SwingPulseApp() {
       return;
     }
     runDigest("auto");
-  }, [now, nextRun, portfolio, serverOk, digestState.busy, runDigest, health?.agent]);
-  function onExtracted(json, { merge = false } = {}) {
-    const base = merge && dataRef.current.portfolio ? mergePortfolios(dataRef.current.portfolio, json) : json;
-    const pf = { ...base, importedAt: (/* @__PURE__ */ new Date()).toISOString() };
-    setData({ portfolio: pf, digest: null });
+  }, [now, nextRun, portfolio, portfolioIL, serverOk, digestState.busy, runDigest, health?.agent]);
+  function onExtracted(json, { merge = false, market: m = "US" } = {}) {
+    const key = bookKey(m);
+    const prevBook = dataRef.current[key];
+    const base = merge && prevBook ? mergePortfolios(prevBook, json) : json;
+    const pf = { ...base, currency: MARKET_CURRENCY[m], importedAt: (/* @__PURE__ */ new Date()).toISOString() };
+    const next = { ...dataRef.current, [key]: pf, digest: null };
+    setData(next);
     setMode("live");
-    if (syncedRef.current) putState({ portfolio: pf, digest: null }).catch(() => {
+    setMarket(m);
+    if (syncedRef.current) putState({ [key]: pf, digest: null }).catch(() => {
     });
     setTab("dashboard");
-    runDigest("import", pf);
+    runDigest("import", { us: next.portfolio, il: next.portfolioIL || null });
     setTimeout(refreshLive, 500);
   }
+  const [importMarket, setImportMarket] = useState("US");
+  const openImport = useCallback((m) => {
+    setImportMarket(m === "IL" || m === "US" ? m : market === "IL" ? "IL" : "US");
+    setImportOpen(true);
+  }, [market]);
   const rows = useMemo(() => (viewPf?.positions || []).map(enrichPosition), [viewPf]);
   const realStats = useMemo(() => portfolioStats(portfolio), [portfolio]);
   const demoStats = useMemo(() => isDemo ? portfolioStats(demo?.portfolio) : null, [isDemo, demo]);
+  const openMarket = openTicker ? marketOf(openTicker) : "US";
+  const openBook = openMarket === "IL" ? ilPf : usPf;
+  const openRow = useMemo(() => {
+    const p = (openBook?.positions || []).find((x) => x.ticker === openTicker);
+    return p ? enrichPosition(p) : null;
+  }, [openBook, openTicker]);
   const stats = useMemo(() => {
     const portfolio2 = viewPf;
     if (!portfolio2) return null;
@@ -4209,7 +4455,7 @@ function SwingPulseApp() {
       await logout();
     } catch {
     }
-    setData({ portfolio: null, digest: null });
+    setData({ portfolio: null, portfolioIL: null, digest: null });
     setAlerts([]);
     setDemo(null);
     syncedRef.current = false;
@@ -4273,12 +4519,12 @@ function SwingPulseApp() {
             "button",
             {
               type: "button",
-              onClick: () => setImportOpen(true),
-              "aria-label": "ייבוא מבלינק",
+              onClick: () => openImport(),
+              "aria-label": "ייבוא תיק",
               className: "flex min-h-10 min-w-10 items-center justify-center gap-1.5 rounded-xl bg-[color:var(--inverse)] px-3 py-2 text-sm font-semibold text-[color:var(--inverse-fg)]",
               children: [
                 /* @__PURE__ */ jsx(Icon, { name: "upload" }),
-                /* @__PURE__ */ jsx("span", { className: "hidden sm:inline", children: "ייבוא מבלינק" })
+                /* @__PURE__ */ jsx("span", { className: "hidden sm:inline", children: "ייבוא תיק" })
               ]
             }
           ),
@@ -4304,6 +4550,7 @@ function SwingPulseApp() {
             ] }),
             /* @__PURE__ */ jsx("button", { type: "button", onClick: leaveSandbox, className: "ms-auto min-h-10 rounded-xl bg-[#0a84ff] px-4 font-semibold text-white", children: "לחבר חשבון אישי" })
           ] }),
+          tab !== "settings" && tab !== "alerts" && (usPf || ilPf || portfolio || portfolioIL) && /* @__PURE__ */ jsx(MarketSwitcher, { market, setMarket }),
           viewPf && !SANDBOX && /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[color:var(--fg-3)]", children: [
             /* @__PURE__ */ jsx("span", { className: `h-1.5 w-1.5 rounded-full ${viewPf.liveAt && !live.error ? "bg-[#30d158]" : "bg-[#ffd60a]"}`, "aria-hidden": "true" }),
             live.error ? /* @__PURE__ */ jsx("span", { className: "text-[color:var(--warn)]", children: live.error }) : viewPf.liveAt ? /* @__PURE__ */ jsxs("span", { children: [
@@ -4384,13 +4631,14 @@ function SwingPulseApp() {
             setAlerts([]);
             if (syncedRef.current) putState({ alerts: [] }).catch(() => {
             });
-          } }) : isDemo && !demo?.zero ? /* @__PURE__ */ jsx(DemoStart, { onStart: startDemo, busy: demoState.busy || !demo && !demoState.error, error: demoState.error, hasReal: !!portfolio }) : !viewPf ? /* @__PURE__ */ jsxs("section", { className: "flex flex-col items-center gap-4 rounded-3xl border border-[color:var(--line)] bg-[color:var(--card)] px-6 py-16 text-center", children: [
+          } }) : isDemo && !demo?.zero ? /* @__PURE__ */ jsx(DemoStart, { onStart: startDemo, busy: demoState.busy || !demo && !demoState.error, error: demoState.error, hasReal: !!(portfolio || portfolioIL) }) : !viewPf ? /* @__PURE__ */ jsxs("section", { className: "flex flex-col items-center gap-4 rounded-3xl border border-[color:var(--line)] bg-[color:var(--card)] px-6 py-16 text-center", children: [
             /* @__PURE__ */ jsx("div", { className: "grid h-14 w-14 place-items-center rounded-2xl bg-[color:var(--accent-bg)] text-[color:var(--accent)]", children: /* @__PURE__ */ jsx(Icon, { name: "upload", className: "h-7 w-7" }) }),
-            /* @__PURE__ */ jsx("h1", { className: "text-xl font-bold", children: "עוד אין תיק" }),
-            /* @__PURE__ */ jsx("p", { className: "max-w-md text-sm text-[color:var(--fg-3)]", children: "מעלים את כל צילומי המסך מבלינק בבת אחת. Gemini מפענח את התיק ומחזיר המלצות סווינג בעברית." }),
-            /* @__PURE__ */ jsx("button", { type: "button", onClick: () => setImportOpen(true), className: "rounded-xl bg-[color:var(--inverse)] px-5 py-3 font-semibold text-[color:var(--inverse-fg)]", children: "ייבוא מבלינק" })
-          ] }) : tab === "table" ? /* @__PURE__ */ jsx(TableTab, { onOpen: setOpenTicker, portfolio: viewPf, rows, stats, verdictOf, digestState, sort, setSort }) : /* @__PURE__ */ jsxs(Fragment, { children: [
-            isDemo && demo?.zero && demoStats && /* @__PURE__ */ jsx(BenchmarkBanner, { demo, demoStats, realStats, cur: viewPf.currency || "USD", onReset: startDemo, resetBusy: demoState.busy }),
+            /* @__PURE__ */ jsx("h1", { className: "text-xl font-bold", children: market === "IL" ? "עוד אין תיק ישראלי" : "עוד אין תיק" }),
+            /* @__PURE__ */ jsx("p", { className: "max-w-md text-sm text-[color:var(--fg-3)]", children: market === "IL" ? "מעלים צילומי מסך של תיק ההשקעות מהבנק או מהברוקר. Gemini מפענח שמות ניירות, כמויות ושערים (גם באגורות) לתיק נפרד בשקלים." : "מעלים את כל צילומי המסך מבלינק בבת אחת. Gemini מפענח את התיק ומחזיר המלצות סווינג בעברית." }),
+            /* @__PURE__ */ jsx("button", { type: "button", onClick: () => openImport(market === "IL" ? "IL" : "US"), className: "rounded-xl bg-[color:var(--inverse)] px-5 py-3 font-semibold text-[color:var(--inverse-fg)]", children: market === "IL" ? "ייבוא מהבנק" : "ייבוא מבלינק" })
+          ] }) : tab === "table" ? /* @__PURE__ */ jsx(TableTab, { onOpen: setOpenTicker, showMarket: hasIL, portfolio: viewPf, rows, stats, verdictOf, digestState, sort, setSort }) : /* @__PURE__ */ jsxs(Fragment, { children: [
+            market === "ALL" && combined && /* @__PURE__ */ jsx(UnifiedCard, { combined, displayCur, setDisplayCur, fx }),
+            isDemo && demo?.zero && demoStats && (market === "US" || market === "ALL" && !hasIL) && /* @__PURE__ */ jsx(BenchmarkBanner, { demo, demoStats, realStats, cur: viewPf.currency || "USD", onReset: startDemo, resetBusy: demoState.busy }),
             /* @__PURE__ */ jsx(
               DashboardTab,
               {
@@ -4403,7 +4651,8 @@ function SwingPulseApp() {
                 verdictOf,
                 full,
                 setFull,
-                onImport: () => setImportOpen(true),
+                onImport: () => openImport(),
+                showMarket: hasIL,
                 onRun: () => isDemo ? runDemoDigest() : runDigest("manual"),
                 canRun: serverOk,
                 isDemo
@@ -4445,19 +4694,30 @@ function SwingPulseApp() {
         openTicker && /* @__PURE__ */ jsx(
           StockSheet,
           {
-            position: rows.find((r) => r.ticker === openTicker),
+            position: openRow,
             verdict: verdictOf(openTicker),
-            currency: viewPf?.currency || "USD",
+            currency: MARKET_CURRENCY[openMarket],
             onClose: () => setOpenTicker(null),
             mode: isDemo ? "demo" : "live",
             demoStats,
             onDemoApplied: onTradeApplied,
-            cash: viewPf?.cashBalance ?? null,
+            cash: openBook?.cashBalance ?? null,
             orders: (isDemo ? demo?.orders : data.orders) || []
           }
         ),
         REMOTE && !SANDBOX && synced && tab !== "settings" && /* @__PURE__ */ jsx(CommandBar, { mode: isDemo ? "demo" : "live", enabled: !isDemo || !!demo?.zero, onApplied: onTradeApplied }),
-        /* @__PURE__ */ jsx(ImportModal, { open: importOpen, onClose: () => setImportOpen(false), onExtracted, serverOk, hasPortfolio: !!portfolio, fromDemo: isDemo })
+        /* @__PURE__ */ jsx(
+          ImportModal,
+          {
+            open: importOpen,
+            onClose: () => setImportOpen(false),
+            onExtracted,
+            serverOk,
+            hasPortfolio: { US: !!portfolio, IL: !!portfolioIL },
+            fromDemo: isDemo,
+            initialMarket: importMarket
+          }
+        )
       ]
     }
   ) });
