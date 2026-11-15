@@ -280,7 +280,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.3.3";
+var APP_VERSION = "6.3.4";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -4190,10 +4190,21 @@ function LoginScreen({ onDone, theme, onToggleTheme }) {
                 /* @__PURE__ */ jsx("span", { className: "block text-sm text-[color:var(--fg-3)]", children: "נסה עכשיו, בלי להירשם. תיק לדוגמה שנשמר רק בדפדפן הזה." })
               ] })
             ] }),
-            /* @__PURE__ */ jsxs("button", { type: "button", onClick: () => setStep("live"), disabled: !agreed, className: `${card} disabled:opacity-45`, style: { borderColor: "var(--accent-line)" }, children: [
+            SB ? (
+              // the owner's own Apps Script server: not for other users, so only a small link
+              /* @__PURE__ */ jsx(
+                "button",
+                {
+                  type: "button",
+                  onClick: () => setStep("live"),
+                  className: "self-center rounded-lg px-2 py-1 text-xs text-[color:var(--fg-4)] underline decoration-[color:var(--line-2)] underline-offset-2 hover:text-[color:var(--fg-3)]",
+                  children: "כניסת מנהל"
+                }
+              )
+            ) : /* @__PURE__ */ jsxs("button", { type: "button", onClick: () => setStep("live"), disabled: !agreed, className: `${card} disabled:opacity-45`, style: { borderColor: "var(--accent-line)" }, children: [
               /* @__PURE__ */ jsx("span", { className: "mt-0.5 grid h-9 w-9 flex-none place-items-center rounded-xl", style: { background: "var(--accent-bg)", color: "var(--accent)" }, children: /* @__PURE__ */ jsx(Icon, { name: "link", className: "h-4 w-4" }) }),
               /* @__PURE__ */ jsxs("span", { className: "min-w-0 flex-1", children: [
-                /* @__PURE__ */ jsx("b", { className: "block", children: SB ? "שרת משלך (מתקדם)" : "הגדר חשבון אישי (Live)" }),
+                /* @__PURE__ */ jsx("b", { className: "block", children: "הגדר חשבון אישי (Live)" }),
                 /* @__PURE__ */ jsx("span", { className: "block text-sm text-[color:var(--fg-3)]", children: "השרת והגיליון שלך ב-Google, בחינם. רק לך יש גישה." })
               ] })
             ] })
