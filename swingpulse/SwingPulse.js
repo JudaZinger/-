@@ -280,7 +280,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.7.2";
+var APP_VERSION = "6.7.3";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -2363,7 +2363,7 @@ var PEEK_RANGES = [["5", "שבוע"], ["21", "חודש"], ["63", "3 חודשים
 function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
   const ref = useDialog(true);
   const [closing, setClosing] = useState(false);
-  const [range, setRange] = useState("21");
+  const [range, setRange] = useState(null);
   const [closes, setCloses] = useState(null);
   const [err, setErr] = useState("");
   const [sample, setSample] = useState(false);
@@ -2392,7 +2392,7 @@ function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
       alive = false;
     };
   }, [p.ticker]);
-  const vals = closes ? [...closes.slice(-Number(range)), p.currentPrice].filter(Number.isFinite) : null;
+  const vals = closes ? [...closes.slice(-Number(range || "21")), p.currentPrice].filter(Number.isFinite) : null;
   const rangeChg = vals && vals.length > 1 ? (vals.at(-1) / vals[0] - 1) * 100 : null;
   const day = p.live?.dayChangePct;
   const sh = Number(p.shares) || 0;
@@ -2431,8 +2431,12 @@ function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
               ] }),
               /* @__PURE__ */ jsxs("div", { className: "ms-auto text-left", children: [
                 /* @__PURE__ */ jsx("b", { className: "block text-xl", children: /* @__PURE__ */ jsx(Num, { children: money(p.currentPrice, currency, 2) }) }),
-                day != null && /* @__PURE__ */ jsxs(Num, { className: `text-sm ${tone(day)}`, children: [
-                  signedPct(day),
+                range && rangeChg != null ? /* @__PURE__ */ jsxs("span", { className: `text-sm ${tone(rangeChg)}`, children: [
+                  /* @__PURE__ */ jsx(Num, { children: signedPct(rangeChg) }),
+                  " ב",
+                  PEEK_RANGES.find((r) => r[0] === range)[1].replace(/^3 /, "-3 ")
+                ] }) : day != null && /* @__PURE__ */ jsxs("span", { className: `text-sm ${tone(day)}`, children: [
+                  /* @__PURE__ */ jsx(Num, { children: signedPct(day) }),
                   " היום"
                 ] })
               ] }),
@@ -2440,20 +2444,17 @@ function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
             ] }),
             /* @__PURE__ */ jsxs("div", { className: "px-5 pt-2", children: [
               err ? /* @__PURE__ */ jsx("div", { className: "grid h-[120px] place-items-center rounded-xl bg-[color:var(--inset)] text-sm text-[color:var(--fg-3)]", children: err }) : /* @__PURE__ */ jsx(Sparkline, { values: vals, buy: p.avgPrice }),
-              /* @__PURE__ */ jsxs("div", { className: `mt-2 items-center gap-1.5 ${err ? "hidden" : "flex"}`, role: "group", "aria-label": "טווח גרף", children: [
-                PEEK_RANGES.map(([n2, label]) => /* @__PURE__ */ jsx(
-                  "button",
-                  {
-                    type: "button",
-                    "aria-pressed": range === n2,
-                    onClick: () => setRange(n2),
-                    className: `sp-press min-h-8 flex-1 rounded-lg border text-xs ${range === n2 ? "border-[#ff9f0a] bg-[#ff9f0a]/10 font-bold" : "border-[color:var(--line)] text-[color:var(--fg-2)]"}`,
-                    children: label
-                  },
-                  n2
-                )),
-                rangeChg != null && /* @__PURE__ */ jsx(Num, { className: `ms-1 min-w-[4.5rem] text-left text-sm font-semibold ${tone(rangeChg)}`, children: signedPct(rangeChg) })
-              ] }),
+              /* @__PURE__ */ jsx("div", { className: `mt-2 items-center gap-1.5 ${err ? "hidden" : "flex"}`, role: "group", "aria-label": "טווח גרף", children: PEEK_RANGES.map(([n2, label]) => /* @__PURE__ */ jsx(
+                "button",
+                {
+                  type: "button",
+                  "aria-pressed": range === n2,
+                  onClick: () => setRange((r) => r === n2 ? null : n2),
+                  className: `sp-press min-h-8 flex-1 rounded-lg border text-xs ${range === n2 ? "border-[#ff9f0a] bg-[#ff9f0a]/10 font-bold" : "border-[color:var(--line)] text-[color:var(--fg-2)]"}`,
+                  children: label
+                },
+                n2
+              )) }),
               sample && /* @__PURE__ */ jsx("p", { className: "mt-1.5 text-xs text-[color:var(--fg-3)]", children: "גרף לדוגמה: בדמו המקומי אין נתוני שוק אמיתיים." })
             ] }),
             /* @__PURE__ */ jsx("div", { className: "grid grid-cols-2 gap-2 px-5 pt-4", children: [
