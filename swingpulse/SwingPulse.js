@@ -280,7 +280,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.7.0";
+var APP_VERSION = "6.7.1";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -3053,6 +3053,20 @@ function StockSheet({ position, verdict, currency, onClose, mode = "live", demoS
     }
   );
 }
+function PressRow({ onOpen, onPeek, children }) {
+  const { swallowClick, ...handlers } = useLongPress(onPeek);
+  return /* @__PURE__ */ jsx(
+    "tr",
+    {
+      ...handlers,
+      onClick: () => {
+        if (!swallowClick()) onOpen();
+      },
+      className: "cursor-pointer select-none [-webkit-touch-callout:none] hover:bg-[color:var(--tint)] data-[holding]:bg-[color:var(--tint)]",
+      children
+    }
+  );
+}
 function TableTab({ portfolio, rows, stats, verdictOf, digestState, sort, setSort, onOpen, showMarket = false }) {
   const cur = portfolio.currency || "USD";
   const sorted = useMemo(() => {
@@ -3061,6 +3075,10 @@ function TableTab({ portfolio, rows, stats, verdictOf, digestState, sort, setSor
       if (k === "stop") return stopRoom(p.currentPrice, validStop(v, p.currentPrice));
       if (k === "target") return v?.target ?? null;
       if (k === "action") return v ? ACTIONS[v.action]?.rank ?? 9 : 99;
+      if (k === "day") return p.live?.dayChangePct ?? null;
+      if (k === "since") return p.pnlPct ?? null;
+      if (k === "qty") return Number(p.shares) || 0;
+      if (k === "rating") return v ? (RATING_RANK[v.action] ?? 2) * 3 + (CONF_RANK[v.confidence] ?? 1) : null;
       return p[k] ?? null;
     };
     const list = [...rows];
@@ -3074,6 +3092,9 @@ function TableTab({ portfolio, rows, stats, verdictOf, digestState, sort, setSor
     });
     return list;
   }, [rows, sort, verdictOf]);
+  const [sortOpen, setSortOpen] = useState(false);
+  const [peek, setPeek] = useState(null);
+  const sortLabel = POSITION_SORTS.find((o) => o.id === sort.key)?.label || TABLE_COLUMNS.find((c) => c.key === sort.key)?.label || "מיון";
   const head = (col) => {
     const active = sort.key === col.key;
     return /* @__PURE__ */ jsx("th", { scope: "col", className: `whitespace-nowrap border-b border-[color:var(--line)] px-3 py-3 text-start text-xs font-medium text-[color:var(--fg-3)] ${col.key === "ticker" ? "sticky right-0 z-[2] bg-[color:var(--card)]" : ""}`, children: /* @__PURE__ */ jsxs(
@@ -3092,17 +3113,42 @@ function TableTab({ portfolio, rows, stats, verdictOf, digestState, sort, setSor
   return /* @__PURE__ */ jsxs("div", { className: "flex flex-col gap-4", children: [
     /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-baseline gap-3", children: [
       /* @__PURE__ */ jsx("h2", { className: "text-lg font-bold", children: "טבלת תיק מלאה" }),
-      /* @__PURE__ */ jsxs("span", { className: "text-sm text-[color:var(--fg-3)]", children: [
+      /* @__PURE__ */ jsxs(
+        "button",
+        {
+          type: "button",
+          onClick: () => setSortOpen(true),
+          "aria-haspopup": "dialog",
+          className: "sp-press inline-flex min-h-9 items-center gap-1.5 self-center rounded-full border border-[color:var(--line)] bg-[color:var(--card)] px-3 text-xs font-semibold",
+          children: [
+            /* @__PURE__ */ jsx("svg", { viewBox: "0 0 24 24", "aria-hidden": "true", className: "h-3.5 w-3.5", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", children: /* @__PURE__ */ jsx("path", { d: "M7 4v16M3 16l4 4 4-4M17 20V4M13 8l4-4 4 4" }) }),
+            sortLabel,
+            /* @__PURE__ */ jsx("span", { className: "text-[color:var(--fg-3)]", children: sort.dir === "asc" ? "↑" : "↓" })
+          ]
+        }
+      ),
+      /* @__PURE__ */ jsxs("span", { className: "basis-full text-sm text-[color:var(--fg-3)]", children: [
         rows.length,
-        " פוזיציות · לחיצה על כותרת ממיינת"
+        " פוזיציות · לחיצה ארוכה על שורה לפרטים מהירים"
       ] })
     ] }),
+    sortOpen && /* @__PURE__ */ jsx(SortSheet, { sort, onChange: setSort, onClose: () => setSortOpen(false) }),
+    peek && /* @__PURE__ */ jsx(
+      QuickPeek,
+      {
+        position: peek,
+        verdict: verdictOf(peek.ticker),
+        currency: peek.nativeCurrency || (marketOf(peek.ticker) === "IL" ? "ILS" : cur),
+        onClose: () => setPeek(null),
+        onOpenFull: () => onOpen?.(peek.ticker)
+      }
+    ),
     /* @__PURE__ */ jsx("div", { className: "overflow-x-auto rounded-2xl border border-[color:var(--line)] bg-[color:var(--card)]", children: /* @__PURE__ */ jsxs("table", { className: "w-full border-collapse text-sm", children: [
       /* @__PURE__ */ jsx("thead", { children: /* @__PURE__ */ jsx("tr", { children: TABLE_COLUMNS.map(head) }) }),
       /* @__PURE__ */ jsx("tbody", { children: sorted.map((p) => {
         const v = verdictOf(p.ticker);
         const pos2 = (p.pnl ?? 0) >= 0;
-        return /* @__PURE__ */ jsxs("tr", { onClick: () => onOpen?.(p.ticker), className: "cursor-pointer hover:bg-[color:var(--tint)]", children: [
+        return /* @__PURE__ */ jsxs(PressRow, { onOpen: () => onOpen?.(p.ticker), onPeek: () => setPeek(p), children: [
           /* @__PURE__ */ jsx("td", { className: "sticky right-0 z-[1] whitespace-nowrap border-b border-[color:var(--line-soft)] bg-[color:var(--card)] px-3 py-3", children: /* @__PURE__ */ jsxs("span", { className: "flex items-center gap-1.5", children: [
             /* @__PURE__ */ jsx("b", { dir: "ltr", children: p.ticker }),
             showMarket && /* @__PURE__ */ jsx(MarketBadge, { p })
