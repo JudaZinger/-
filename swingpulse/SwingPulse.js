@@ -120,12 +120,88 @@ function marketOf(ticker) {
   return /\.TA$/.test(t) || /^\d{5,9}$/.test(t) ? "IL" : "US";
 }
 var bookKey = (market) => market === "IL" ? "portfolioIL" : "portfolio";
+var TASE_SYMBOLS = {
+  "לאומי": "LUMI.TA",
+  "בנק לאומי": "LUMI.TA",
+  "LEUMI": "LUMI.TA",
+  "פועלים": "POLI.TA",
+  "בנק הפועלים": "POLI.TA",
+  "HAPOALIM": "POLI.TA",
+  "דיסקונט": "DSCT.TA",
+  "בנק דיסקונט": "DSCT.TA",
+  "מזרחי טפחות": "MZTF.TA",
+  "מזרחי": "MZTF.TA",
+  "הבינלאומי": "FIBI.TA",
+  "בינלאומי": "FIBI.TA",
+  "טבע": "TEVA.TA",
+  "TEVA": "TEVA.TA",
+  "נייס": "NICE.TA",
+  "NICE": "NICE.TA",
+  "אנלייט": "ENLT.TA",
+  "אנלייט אנרגיה": "ENLT.TA",
+  "אלביט מערכות": "ESLT.TA",
+  "אלביט": "ESLT.TA",
+  "בזק": "BEZQ.TA",
+  "כיל": "ICL.TA",
+  "איי.סי.אל": "ICL.TA",
+  "ICL": "ICL.TA",
+  "נובה": "NVMI.TA",
+  'אלביט מערכות בע"מ': "ESLT.TA",
+  "טאואר": "TSEM.TA",
+  "עזריאלי": "AZRG.TA",
+  "עזריאלי קבוצה": "AZRG.TA",
+  "הפניקס": "PHOE.TA",
+  "הראל": "HARL.TA",
+  "הראל השקעות": "HARL.TA",
+  "שופרסל": "SAE.TA",
+  "שטראוס": "STRS.TA",
+  "דלק קבוצה": "DLEKG.TA",
+  "ארית": "ARIT.TA",
+  "ארית תעשיות": "ARIT.TA",
+  "ARIT": "ARIT.TA",
+  "אורמת": "ORA.TA",
+  "אורמת טכנו": "ORA.TA",
+  "מליסרון": "MLSR.TA",
+  "אמות": "AMOT.TA",
+  "ביג": "BIG.TA",
+  "שיכון ובינוי": "SKBN.TA",
+  "אלוני חץ": "ALHE.TA",
+  "מנורה מבטחים": "MMHD.TA",
+  "כלל עסקי ביטוח": "CLIS.TA",
+  "אל על": "ELAL.TA",
+  "פז": "PZOL.TA",
+  "פז נפט": "PZOL.TA",
+  'ת"א 35': "TA35.TA",
+  'ת"א-35': "TA35.TA",
+  "תא 35": "TA35.TA",
+  'ת"א 125': "TA125.TA",
+  'ת"א-125': "TA125.TA"
+};
+function taseSymbol({ ticker, companyName, securityNumber } = {}) {
+  const t = String(ticker || "").trim().toUpperCase().replace(/^TASE:/, "");
+  if (/^[A-Z][A-Z0-9]{0,9}\.TA$/.test(t)) return t;
+  if (/^[A-Z][A-Z0-9]{0,9}$/.test(t) && t.length >= 2) return `${t}.TA`;
+  const name = String(companyName || "").replace(/\s+/g, " ").trim();
+  if (TASE_SYMBOLS[name]) return TASE_SYMBOLS[name];
+  const hit = Object.keys(TASE_SYMBOLS).filter((k) => k.length >= 3 && name.includes(k)).sort((a, b) => b.length - a.length)[0];
+  if (hit) return TASE_SYMBOLS[hit];
+  const n2 = String(securityNumber || ticker || "").replace(/\D/g, "");
+  return n2.length >= 5 ? n2 : t || null;
+}
 var num = (v) => v == null || v === "" || !Number.isFinite(Number(v)) ? null : Number(v);
 var pos = (v) => num(v) != null && num(v) > 0;
 function repairILBook(book) {
   if (!book || !Array.isArray(book.positions)) return { book, changed: false };
   let changed = false;
-  const positions = book.positions.map((p) => {
+  const positions = book.positions.map((p0) => {
+    let p = p0;
+    if (/[^\x20-\x7E]/.test(String(p.ticker || ""))) {
+      const sym = taseSymbol({ companyName: p.companyName || String(p.ticker).replace(/\./g, " ") });
+      if (sym && /^[\x20-\x7E]+$/.test(sym)) {
+        p = { ...p, ticker: sym };
+        changed = true;
+      }
+    }
     const price = num(p.currentPrice), avg = num(p.avgPrice), shares = num(p.shares);
     if (!pos(price) || !pos(avg) || avg / price <= 20) return p;
     changed = true;
@@ -199,7 +275,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.3.1";
+var APP_VERSION = "6.3.2";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";

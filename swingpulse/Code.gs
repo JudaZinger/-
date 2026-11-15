@@ -8,7 +8,7 @@
    Secrets live in Script Properties (only the owner can read them).
    =================================================================================== */
 
-var GAS_VERSION = '6.3.0';
+var GAS_VERSION = '6.3.2';
 var DEFAULT_MODEL = 'gemini-flash-latest';
 var FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash'];
 var CELL_MAX = 45000;                 // a Sheets cell holds 50,000 characters; keep a margin
@@ -335,21 +335,28 @@ function getQuotes_(tickers) {
   var quotes = {}, failed = [], reqs = [], idx = [];
   list.forEach(function (t) {
     var sym = toYahoo(t);
-    if (!sym) { failed.push({ ticker: t, reason: 'לא נסחר (זכות/CVR)' }); return; }
+    if (!sym) { failed.push({ ticker: t, reason: /[^\x20-\x7E]/.test(t) ? 'אין סימול בורסה' : 'לא נסחר (זכות/CVR)' }); return; }
     idx.push(t);
     reqs.push({ url: 'https://query1.finance.yahoo.com/v8/finance/chart/' + encodeURIComponent(sym) + '?range=6mo&interval=1d&includePrePost=false',
       muteHttpExceptions: true, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130 Safari/537.36' } });
   });
-  var responses = reqs.length ? UrlFetchApp.fetchAll(reqs) : [];
+  var responses = [];
+  try { responses = reqs.length ? UrlFetchApp.fetchAll(reqs) : []; }
+  catch (e) { console.warn('yahoo batch: ' + e.message); responses = idx.map(function () { return null; }); }
   var retry = [];
   responses.forEach(function (res, i) {
     var t = idx[i];
     try {
-      if (res.getResponseCode() !== 200) throw new Error('HTTP ' + res.getResponseCode());
+      if (!res || res.getResponseCode() !== 200) throw new Error('HTTP ' + (res ? res.getResponseCode() : 'fail'));
       quotes[t] = Object.assign({ symbol: toYahoo(t), source: 'yahoo' }, parseChart(JSON.parse(res.getContentText())));
     } catch (e) { retry.push(t); }
   });
-  // fallback for whatever Yahoo refused: Stooq's latest quote (no moving averages)
+  // fallback for whatever Yahoo refused: Stooq's latest quote (no moving averages). US listings only:
+  // Stooq has no Tel Aviv funds, and one unreachable address used to fail the whole batch (prices and the $ rate).
+  retry = retry.filter(function (t) {
+    if (/\.TA$/i.test(toYahoo(t))) { failed.push({ ticker: t, reason: 'אין מחיר חי ב-Yahoo (נשאר המחיר מהייבוא)' }); return false; }
+    return true;
+  });
   if (retry.length) {
     var sreq = retry.map(function (t) {
       // Stooq only knows US listings as .us: a foreign suffix (.TA) is asked as is
@@ -357,9 +364,13 @@ function getQuotes_(tickers) {
       var st = /\.[a-z]+$/.test(sym) ? sym : sym.replace(/-/g, '.') + '.us';
       return { url: 'https://stooq.com/q/l/?s=' + encodeURIComponent(st) + '&f=sd2t2ohlcp&h&e=json', muteHttpExceptions: true };
     });
-    UrlFetchApp.fetchAll(sreq).forEach(function (res, i) {
+    var sres;
+    try { sres = UrlFetchApp.fetchAll(sreq); }
+    catch (e) { console.warn('stooq batch: ' + e.message); sres = sreq.map(function () { return null; }); }
+    sres.forEach(function (res, i) {
       var t = retry[i];
       try {
+        if (!res) throw new Error('unreachable');
         var j = JSON.parse(res.getContentText().replace(/,\s*}/g, '}'));
         var s = (j.symbols || [])[0] || {};
         var ta = /\.TA$/i.test(toYahoo(t)), k = ta ? 0.01 : 1;   // Stooq quotes Tel Aviv in agorot too
@@ -1290,7 +1301,7 @@ var __quotes = (function () {
 /** Portfolio ticker → Yahoo symbol. Returns null for things that are not tradable (e.g. CVR rights). */
 function toYahoo(ticker) {
   const t = String(ticker || '').trim().toUpperCase();
-  if (!t || /\.CVR$|^CVR/.test(t)) return null;
+  if (!t || /\.CVR$|^CVR/.test(t) || /[^\x20-\x7E]/.test(t)) return null;   // CVRs, and names in Hebrew (not a symbol)
   if (EXCHANGE_SUFFIX.test(t)) return t;            // TEVA.TA, VOD.L, SHOP.TO: Yahoo's own exchange suffix
   if (/^\d{5,9}$/.test(t)) return `${t}.TA`;         // a TASE security number (funds / ETFs, e.g. 1146125)
   return t.replace(/\./g, '-');                      // BRK.B -> BRK-B (US share classes)
@@ -2008,7 +2019,13 @@ function normalizeAgorot(p) {
 function repairILBook(book) {
   if (!book || !Array.isArray(book.positions)) return { book, changed: false };
   let changed = false;
-  const positions = book.positions.map(p => {
+  const positions = book.positions.map(p0 => {
+    let p = p0;
+    // a Hebrew name saved as the ticker (imported before the name map): give it its .TA symbol
+    if (/[^\x20-\x7E]/.test(String(p.ticker || ''))) {
+      const sym = taseSymbol({ companyName: p.companyName || String(p.ticker).replace(/\./g, ' ') });
+      if (sym && /^[\x20-\x7E]+$/.test(sym)) { p = { ...p, ticker: sym }; changed = true; }
+    }
     const price = num(p.currentPrice), avg = num(p.avgPrice), shares = num(p.shares);
     if (!pos(price) || !pos(avg) || avg / price <= 20) return p;
     changed = true;
