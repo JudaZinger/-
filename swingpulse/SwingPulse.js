@@ -199,7 +199,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.3.0";
+var APP_VERSION = "6.3.1";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -4290,22 +4290,21 @@ function SwingPulseApp() {
   }, [healthNonce]);
   useEffect(() => {
     if (API_BASE !== "" && !REMOTE || typeof window === "undefined") return void 0;
-    const files = ["SwingPulse.js", "index.html"].map((f) => new URL(f, window.location.href).href);
-    const stamp = (r) => r.headers.get("etag") || r.headers.get("last-modified") || "";
-    let baseline = null, timer = null, alive = true;
+    const url = new URL("index.html", window.location.href).href;
+    let timer = null, alive = true;
     const check = async () => {
       try {
-        const now2 = (await Promise.all(files.map((u) => fetch(u, { method: "HEAD", cache: "no-store" }).then(stamp)))).join("|");
-        if (baseline == null) baseline = now2;
-        else if (now2 && now2 !== baseline && alive) {
+        const html = await fetch(`${url}?_=${Date.now()}`, { cache: "no-store" }).then((r) => r.ok ? r.text() : "");
+        const live2 = (html.match(/SwingPulse\.js\?v=([\w.\-]+)/) || [])[1];
+        if (live2 && live2 !== APP_VERSION && alive) {
           setUpdateReady(true);
           return;
         }
       } catch {
       }
-      if (alive) timer = setTimeout(check, 30 * 1e3);
+      if (alive) timer = setTimeout(check, 5 * 60 * 1e3);
     };
-    check();
+    timer = setTimeout(check, 20 * 1e3);
     return () => {
       alive = false;
       clearTimeout(timer);
