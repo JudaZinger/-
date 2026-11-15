@@ -8,7 +8,7 @@
    Secrets live in Script Properties (only the owner can read them).
    =================================================================================== */
 
-var GAS_VERSION = '6.5.0';
+var GAS_VERSION = '6.7.0';
 var DEFAULT_MODEL = 'gemini-flash-latest';
 var FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash'];
 var CELL_MAX = 45000;                 // a Sheets cell holds 50,000 characters; keep a margin
@@ -805,7 +805,7 @@ function parseTrade_(text, mode) {
   if (!String(text || '').trim()) throw apiError_('bad_request', 'ההודעה ריקה');
   var h = holderFor_(mode);
   var r = geminiGenerate_({
-    contents: [{ role: 'user', parts: [{ text: tradeParsePrompt(text, bothBooksForPrompt(h.portfolio, h.portfolioIL)) }] }],
+    contents: [{ role: 'user', parts: [{ text: tradeParsePrompt(text, bothBooksForPrompt(h.portfolio, h.portfolioIL), recsForPrompt(h.digest, bothBooksForPrompt(h.portfolio, h.portfolioIL))) }] }],
     generationConfig: { responseMimeType: 'application/json', responseJsonSchema: TRADE_PARSE_SCHEMA }
   }, { json: true });
   var parsed = cleanParsedTrades(r.data);
@@ -1746,7 +1746,16 @@ const TRADE_PARSE_SCHEMA = {
   required: ['trades', 'reply']
 };
 
-function tradeParsePrompt(text, portfolio) {
+/** The latest recommendations as short lines for the trade parser: only the ones that call for a trade. */
+function recsForPrompt(digest, portfolio) {
+  const held = new Map(((portfolio && portfolio.positions) || []).map(p => [String(p.ticker).toUpperCase(), p]));
+  return ((digest && digest.positions) || [])
+    .filter(v => v && held.has(String(v.ticker).toUpperCase()) && v.action && v.action !== 'HOLD')
+    .slice(0, 40)
+    .map(v => `${String(v.ticker).toUpperCase()}: ${v.action}`).join('; ');
+}
+
+function tradeParsePrompt(text, portfolio, recs = '') {
   const held = ((portfolio && portfolio.positions) || []).map(p => `${p.ticker} (${p.companyName || p.ticker}, ${p.shares} מניות, ממוצע ${p.avgPrice}${/\.TA$/.test(p.ticker) ? ' ₪' : ''})`).join('; ') || 'התיק ריק';
   return `You turn a person's message about their own stock trades (written in Hebrew, sometimes with English tickers) into structured trades.
 Their portfolio now: ${held}.
@@ -1756,7 +1765,9 @@ Rules:
 - An Israeli company named in Hebrew, or a trade said to be in Tel Aviv ("בבורסה בתל אביב", "בת\"א", "בשקלים"), gets its .TA symbol. If the portfolio already holds the stock, use the exact symbol it holds. Otherwise a company name maps to its US ticker.
 - shares: the number of shares said. For SELL_ALL put null. If they gave a money amount instead of shares, put it in amount and shares null.
 - price: the price per share they said, in the stock's own currency: USD for US stocks, shekels (₪, not agorot) for .TA stocks; if they said agorot (אגורות) divide by 100. If they did not say a price, null (the server will use the live price).
-- Never invent numbers. If the message is not about a trade, return an empty trades list.
+${recs ? `- The app's latest recommendations (already shown to the person): ${recs}.
+  When the message confirms them in general, without naming stocks ("עשיתי לפי ההוראות שלך", "מכרתי מה שצריך", "ביצעתי את ההמלצות"), turn the recommendations into trades from the portfolio above: TAKE_PROFIT or CUT_LOSS = SELL_ALL; TRIM = SELL_PARTIAL with shares = one third of the shares held (round to 4 decimals); ADD = no trade (the amount is unknown: say in reply that the amount bought is needed). "מכרתי מה שצריך" covers only the sell recommendations. If they name some stocks ("מכרתי את AMD כמו שאמרת"), use only those. price stays null. In reply, list what you understood so they can check it.
+` : ''}- Never invent numbers. If the message is not about a trade, return an empty trades list.
 - reply: one short natural Hebrew sentence that says what you understood or what is missing.
 Message: """${String(text || '').slice(0, 600)}"""`;
 }
@@ -1766,11 +1777,11 @@ function cleanParsedTrades(d) {
   const trades = (Array.isArray(d && d.trades) ? d.trades : [])
     .map(t => ({ type: TRADE_TYPES.includes(t.type) ? t.type : null, ticker: T(t.ticker), shares: n(t.shares), price: n(t.price), amount: n(t.amount) }))
     .filter(t => t.type && t.ticker)
-    .slice(0, 8);
+    .slice(0, 24);
   return { trades, reply: String((d && d.reply) || '').slice(0, 300) };
 }
 
-return { TRADE_TYPES, TRADE_HE, recomputePortfolio, previewTrade, applyTrades, TRADE_PARSE_SCHEMA, tradeParsePrompt, cleanParsedTrades };
+return { TRADE_TYPES, TRADE_HE, recomputePortfolio, previewTrade, applyTrades, TRADE_PARSE_SCHEMA, recsForPrompt, tradeParsePrompt, cleanParsedTrades };
 })();
 var TRADE_TYPES = __trades.TRADE_TYPES;
 var TRADE_HE = __trades.TRADE_HE;
@@ -1778,6 +1789,7 @@ var recomputePortfolio = __trades.recomputePortfolio;
 var previewTrade = __trades.previewTrade;
 var applyTrades = __trades.applyTrades;
 var TRADE_PARSE_SCHEMA = __trades.TRADE_PARSE_SCHEMA;
+var recsForPrompt = __trades.recsForPrompt;
 var tradeParsePrompt = __trades.tradeParsePrompt;
 var cleanParsedTrades = __trades.cleanParsedTrades;
 

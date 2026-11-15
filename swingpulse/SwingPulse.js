@@ -280,7 +280,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.6.0";
+var APP_VERSION = "6.7.0";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -4218,6 +4218,13 @@ function TradePreview({ p, mode }) {
 function TradeConfirm({ result, mode, busy, error, onConfirm, onCancel }) {
   const ok = (result.previews || []).filter((p) => p.ok);
   const live = mode === "live";
+  if (!(result.previews || []).length) {
+    return /* @__PURE__ */ jsxs("div", { className: "flex flex-col gap-3", children: [
+      result.reply && /* @__PURE__ */ jsx("p", { className: "text-sm text-[color:var(--fg-2)]", children: result.reply }),
+      /* @__PURE__ */ jsx("p", { className: "text-sm text-[color:var(--fg-3)]", children: 'לא זיהיתי קנייה או מכירה. נסו למשל: "מכרתי 5 מניות PLTR ב-173", או "ביצעתי את ההמלצות" אחרי סריקה.' }),
+      /* @__PURE__ */ jsx("button", { type: "button", onClick: onCancel, className: "min-h-10 self-start rounded-xl border border-[color:var(--line-2)] px-4 text-sm", children: "סגור" })
+    ] });
+  }
   return /* @__PURE__ */ jsxs("div", { className: "flex flex-col gap-3", children: [
     result.reply && /* @__PURE__ */ jsx("p", { className: "text-sm text-[color:var(--fg-2)]", children: result.reply }),
     (result.previews || []).length === 0 ? /* @__PURE__ */ jsx("p", { className: "text-sm text-[color:var(--fg-3)]", children: 'לא זיהיתי קנייה או מכירה. נסו למשל: "מכרתי 5 מניות PLTR ב-173".' }) : /* @__PURE__ */ jsx("ul", { className: "flex flex-col gap-2", children: result.previews.map((p, i) => /* @__PURE__ */ jsx(TradePreview, { p: { ...p, trade: { ...p.trade, priceSource: result.trades?.[i]?.priceSource } }, mode }, i)) }),
@@ -4244,7 +4251,11 @@ function CommandBar({ mode, enabled, onApplied, shown = false, onDismiss }) {
   useEffect(() => {
     if (shown) inputRef.current?.focus();
   }, [shown]);
-  const [text, setText] = useState("");
+  const [text, setTextRaw] = useState("");
+  const setText = (v) => {
+    setTextRaw(v);
+    if (!v && inputRef.current) inputRef.current.style.height = "auto";
+  };
   const [phase, setPhase] = useState("idle");
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
@@ -4322,28 +4333,40 @@ function CommandBar({ mode, enabled, onApplied, shown = false, onDismiss }) {
         "form",
         {
           onSubmit: submit,
-          className: `items-center gap-2 rounded-2xl border bg-[color:var(--nav)] p-1.5 shadow-xl backdrop-blur-xl md:flex ${shown ? "flex" : "hidden"}`,
+          className: `items-end gap-2 rounded-2xl border bg-[color:var(--nav)] p-1.5 shadow-xl backdrop-blur-xl md:flex ${shown ? "flex" : "hidden"}`,
           style: { borderColor: isDemo ? "var(--warn-line)" : "var(--line-2)" },
           children: [
             /* @__PURE__ */ jsx(
               "span",
               {
-                className: "flex-none rounded-xl px-2 py-1 text-[11px] font-bold",
+                className: "mb-2.5 flex-none rounded-xl px-2 py-1 text-[11px] font-bold",
                 style: isDemo ? { background: "var(--warn-bg)", color: "var(--warn)" } : { background: "var(--accent-bg)", color: "var(--accent)" },
                 children: isDemo ? "דמו" : "AI"
               }
             ),
             /* @__PURE__ */ jsx(
-              "input",
+              "textarea",
               {
                 ref: inputRef,
                 value: text,
-                onChange: (e) => setText(e.target.value),
+                rows: 1,
                 dir: "rtl",
                 enterKeyHint: "send",
+                onChange: (e) => {
+                  setText(e.target.value);
+                  const el = e.target;
+                  el.style.height = "auto";
+                  el.style.height = `${Math.min(el.scrollHeight, 120)}px`;
+                },
+                onKeyDown: (e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    e.currentTarget.form.requestSubmit();
+                  }
+                },
                 "aria-label": isDemo ? "עדכון עסקה בדמו בטקסט חופשי" : "עדכון עסקה בתיק האמיתי בטקסט חופשי",
                 placeholder: isDemo ? "מה עשית בדמו?" : "מה עשית היום? (קניתי 3 NVDA)",
-                className: "min-w-0 flex-1 bg-transparent px-1 text-base outline-none placeholder:text-[color:var(--fg-3)]"
+                className: "max-h-[120px] min-w-0 flex-1 resize-none self-center overflow-y-auto bg-transparent px-1 py-2 text-right text-base leading-6 outline-none placeholder:text-[color:var(--fg-3)]"
               }
             ),
             /* @__PURE__ */ jsx(
