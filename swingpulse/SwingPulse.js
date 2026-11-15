@@ -280,7 +280,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.5.0";
+var APP_VERSION = "6.5.1";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -643,6 +643,19 @@ async function sandboxRpc(fn, args) {
     }
     case "quotes":
       return { quotes: {}, failed: [], at: (/* @__PURE__ */ new Date()).toISOString() };
+    case "candles": {
+      const t = String(args[0] || "").toUpperCase();
+      const p = (db.demo.portfolio?.positions || []).find((x) => String(x.ticker).toUpperCase() === t);
+      const end = Number(p?.currentPrice) || 100, start = Number(p?.avgPrice) || end * 0.92;
+      let seed = [...t].reduce((a, c) => a * 31 + c.charCodeAt(0), 7) % 233280;
+      const rnd = () => (seed = (seed * 9301 + 49297) % 233280) / 233280 - 0.5;
+      const n2 = 64, now = Math.floor(Date.now() / 1e3);
+      const candles = Array.from({ length: n2 }, (_, i) => {
+        const c = +(start + (end - start) * (i / (n2 - 1)) * (1 + rnd() * 0.05)).toFixed(2);
+        return { t: now - (n2 - 1 - i) * 86400, o: c, h: c, l: c, c: i === n2 - 1 ? end : c, v: 0 };
+      });
+      return { candles, sample: true, exchange: null, gmtoffset: 0 };
+    }
     case "getDemo":
       return view();
     case "demoReset":
@@ -2281,6 +2294,7 @@ function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
   const [range, setRange] = useState("21");
   const [closes, setCloses] = useState(null);
   const [err, setErr] = useState("");
+  const [sample, setSample] = useState(false);
   const close = useCallback(() => {
     setClosing(true);
     setTimeout(onClose, 200);
@@ -2295,7 +2309,10 @@ function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
   useEffect(() => {
     let alive = true;
     fetchCandles(p.ticker, "3mo").then((r) => {
-      if (alive) setCloses((r.candles || []).map((c) => c.c));
+      if (alive) {
+        setCloses((r.candles || []).map((c) => c.c));
+        setSample(!!r.sample);
+      }
     }).catch((e) => {
       if (alive) setErr(e.message || "אין נתוני גרף");
     });
@@ -2361,7 +2378,8 @@ function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
                   n2
                 )),
                 rangeChg != null && /* @__PURE__ */ jsx(Num, { className: `ms-1 min-w-[4.5rem] text-left text-sm font-semibold ${tone(rangeChg)}`, children: signedPct(rangeChg) })
-              ] })
+              ] }),
+              sample && /* @__PURE__ */ jsx("p", { className: "mt-1.5 text-xs text-[color:var(--fg-3)]", children: "גרף לדוגמה: בדמו המקומי אין נתוני שוק אמיתיים." })
             ] }),
             /* @__PURE__ */ jsx("div", { className: "grid grid-cols-2 gap-2 px-5 pt-4", children: [
               ["מחיר קנייה", /* @__PURE__ */ jsx(Num, { children: money(p.avgPrice, currency, 2) })],
