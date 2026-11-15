@@ -280,7 +280,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.3.4";
+var APP_VERSION = "6.4.0";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -1296,11 +1296,11 @@ var THEME_TOKENS = {
   }
 };
 var tokenBlock = (t) => Object.entries(THEME_TOKENS[t]).map(([k, v]) => `--${k}:${v};`).join("");
-var STAGGER = Array.from({ length: 24 }, (_, i) => `.sp-stagger>*:nth-child(${i + 1}){animation-delay:${i * 40}ms}`).join("");
+var STAGGER = [0, 40, 75, 105, 130, 150, 165].map((d, i) => `.sp-stagger>*:nth-child(${i + 1}){animation-delay:${d}ms}`).join("") + ".sp-stagger>*:nth-child(n+8){animation-delay:175ms}";
 var GLOBAL_CSS = `
 :root,[data-theme=dark]{${tokenBlock("dark")}color-scheme:dark}
 [data-theme=light]{${tokenBlock("light")}color-scheme:light}
-:root{--spring:cubic-bezier(0.22,1,0.36,1);--ease-sheet:cubic-bezier(0.16,1,0.3,1)}
+:root{--spring:cubic-bezier(0.22,1,0.36,1);--ease-out:cubic-bezier(0.23,1,0.32,1);--ease-in-out:cubic-bezier(0.77,0,0.175,1);--ease-drawer:cubic-bezier(0.32,0.72,0,1);--ease-sheet:var(--ease-drawer)}
 html,body{background:var(--bg);color:var(--fg);transition:background-color .3s ease,color .3s ease}
 [data-theme=light] [class*="bg-[color:var(--card)]"]{box-shadow:var(--shadow)}
 .sp-num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
@@ -1320,35 +1320,40 @@ html,body{background:var(--bg);color:var(--fg);transition:background-color .3s e
   font-size:15px;font-weight:600;line-height:1.3;font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
 
 /* tactile press feedback */
-button,[role=button],[role=tab],summary,a,.sp-press{-webkit-tap-highlight-color:transparent;transition-property:transform,background-color,border-color,color,box-shadow,opacity;transition-duration:.32s;transition-timing-function:var(--spring)}
-button:not(:disabled):active,[role=button]:active,[role=tab]:active,summary:active,a:active,.sp-press:active{transform:scale(0.96)!important;transition-duration:.09s}
+/* colors: quick and plain (ease, ~180ms); press: scale .97 with a strong ease-out, released fast */
+button,[role=button],[role=tab],summary,a,.sp-press{-webkit-tap-highlight-color:transparent;
+  transition:transform .16s var(--ease-out),background-color .18s ease,border-color .18s ease,color .18s ease,box-shadow .18s ease,opacity .18s ease}
+button:not(:disabled):active,[role=button]:active,[role=tab]:active,summary:active,a:active,.sp-press:active{transform:scale(0.97)!important;transition-duration:.1s}
 .sp-press-soft:not(:disabled):active{transform:scale(0.985)!important}
 
 /* modal / bottom sheet */
 @keyframes sp-fade{from{opacity:0}to{opacity:1}}
 @keyframes sp-fade-out{from{opacity:1}to{opacity:0}}
-@keyframes sp-sheet-in{from{transform:translateY(32px)}to{transform:none}}
-@keyframes sp-sheet-out{from{opacity:1;transform:none}to{opacity:0;transform:translateY(28px)}}
-.sp-fade{animation:sp-fade .25s ease both}
-.sp-overlay{background:var(--overlay);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);animation:sp-fade .32s var(--ease-sheet) both}
-.sp-overlay[data-closing]{animation:sp-fade-out .22s ease both}
-.sp-sheet{animation:sp-sheet-in .32s var(--ease-sheet) both}
-.sp-sheet[data-closing]{animation:sp-sheet-out .22s cubic-bezier(0.4,0,1,1) both}
+@keyframes sp-sheet-in{from{transform:translateY(40px)}to{transform:none}}
+@keyframes sp-sheet-out{from{opacity:1;transform:none}to{opacity:0;transform:translateY(16px)}}
+.sp-fade{animation:sp-fade .2s ease both}
+.sp-overlay{background:var(--overlay);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);animation:sp-fade .3s var(--ease-out) both}
+.sp-overlay[data-closing]{animation:sp-fade-out .2s var(--ease-out) both}
+/* sheets: iOS drawer curve in; out is faster than in and never ease-in */
+.sp-sheet{animation:sp-sheet-in .42s var(--ease-drawer) both}
+.sp-sheet[data-closing]{animation:sp-sheet-out .2s var(--ease-out) both}
 
 /* staggered entrance */
 @keyframes sp-rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-.sp-stagger>*{animation:sp-rise .46s var(--spring) backwards}
-.sp-tab{animation:sp-rise .4s var(--spring) backwards}
+.sp-stagger>*{animation:sp-rise .34s var(--ease-out) backwards}
+/* tabs switch many times a day: a short settle, not an entrance */
+@keyframes sp-settle{from{opacity:.4;transform:translateY(3px)}to{opacity:1;transform:none}}
+.sp-tab{animation:sp-settle .2s var(--ease-out) backwards}
 ${STAGGER}
 
 /* sliding segmented control */
 .sp-seg-pill{position:absolute;left:0;top:0;border-radius:.6rem;background:var(--seg-pill);box-shadow:var(--seg-shadow);pointer-events:none;
-  transition:transform .42s var(--spring),width .42s var(--spring),height .42s var(--spring)}
+  transition:transform .3s var(--ease-out),width .3s var(--ease-out),height .3s var(--ease-out)}
 .sp-seg-pill[data-instant]{transition:none}
 .sp-seg-pill.sp-accent{background:var(--accent-bg);box-shadow:none}
 
 /* accordion */
-.sp-acc{display:grid;grid-template-rows:0fr;opacity:0;transition:grid-template-rows .36s var(--spring),opacity .28s ease}
+.sp-acc{display:grid;grid-template-rows:0fr;opacity:0;transition:grid-template-rows .28s var(--ease-out),opacity .2s ease}
 .sp-acc[data-open=true]{grid-template-rows:1fr;opacity:1}
 .sp-acc>div{min-height:0;overflow:hidden}
 
@@ -1358,10 +1363,17 @@ ${STAGGER}
 .sp-list>li::before{content:"";position:absolute;inset-inline-start:0;top:.62em;width:.38rem;height:.38rem;border-radius:999px;background:var(--marker,var(--fg-4))}
 
 /* popover */
-@keyframes sp-pop{from{opacity:0;transform:translateY(-6px) scale(.98)}to{opacity:1;transform:none}}
-.sp-pop{animation:sp-pop .26s var(--spring) both;transform-origin:top left}
+@keyframes sp-pop{from{opacity:0;transform:translateY(-4px) scale(.97)}to{opacity:1;transform:none}}
+.sp-pop{animation:sp-pop .18s var(--ease-out) both;transform-origin:top right}
 
-@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-delay:0ms!important;transition-duration:.01ms!important}}
+/* reduced motion: no movement, but keep short fades so changes are still understandable */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-delay:0ms!important;transition-property:color,background-color,border-color,opacity!important;transition-duration:.15s!important}
+  .sp-sheet,.sp-stagger>*,.sp-tab,.sp-pop{animation:sp-fade .15s ease both!important}
+  .sp-sheet[data-closing]{animation:sp-fade-out .15s ease both!important}
+  .sp-seg-pill{transition:none!important}
+  button:active,[role=button]:active,[role=tab]:active,.sp-press:active{transform:none!important}
+}
 `;
 if (typeof document !== "undefined" && !document.getElementById("sp-css")) {
   const el = document.createElement("style");
@@ -1406,8 +1418,8 @@ function ThemeToggle({ theme, onToggle }) {
       title: dark ? "מצב בהיר" : "מצב כהה",
       className: "relative grid h-10 w-10 flex-none place-items-center overflow-hidden rounded-xl border border-[color:var(--line-2)] hover:bg-[color:var(--tint)]",
       children: [
-        /* @__PURE__ */ jsx("span", { className: `absolute transition-all duration-500 ${dark ? "rotate-0 scale-100 opacity-100" : "-rotate-90 scale-50 opacity-0"}`, children: /* @__PURE__ */ jsx(Icon, { name: "moon" }) }),
-        /* @__PURE__ */ jsx("span", { className: `absolute transition-all duration-500 ${dark ? "rotate-90 scale-50 opacity-0" : "rotate-0 scale-100 opacity-100"}`, children: /* @__PURE__ */ jsx(Icon, { name: "sun" }) })
+        /* @__PURE__ */ jsx("span", { className: `absolute transition-all duration-300 ${dark ? "rotate-0 scale-100 opacity-100" : "-rotate-90 scale-50 opacity-0"}`, children: /* @__PURE__ */ jsx(Icon, { name: "moon" }) }),
+        /* @__PURE__ */ jsx("span", { className: `absolute transition-all duration-300 ${dark ? "rotate-90 scale-50 opacity-0" : "rotate-0 scale-100 opacity-100"}`, children: /* @__PURE__ */ jsx(Icon, { name: "sun" }) })
       ]
     }
   );

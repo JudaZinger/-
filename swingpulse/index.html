@@ -16,6 +16,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script>if (window.tailwind) tailwind.config = { future: { hoverOnlyWhenSupported: true } };</script>
 <script type="importmap">
 { "imports": {
   "react": "https://esm.sh/react@18.3.1",
@@ -32,7 +33,7 @@
 <script type="module">
   import { createElement } from "react";
   import { createRoot } from "react-dom/client";
-  import SwingPulse from "./SwingPulse.js?v=6.3.4";
+  import SwingPulse from "./SwingPulse.js?v=6.4.0";
   createRoot(document.getElementById("root")).render(createElement(SwingPulse));
 </script>
 </body>
