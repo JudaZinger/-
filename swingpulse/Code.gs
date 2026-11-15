@@ -8,7 +8,7 @@
    Secrets live in Script Properties (only the owner can read them).
    =================================================================================== */
 
-var GAS_VERSION = '6.3.2';
+var GAS_VERSION = '6.5.0';
 var DEFAULT_MODEL = 'gemini-flash-latest';
 var FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash'];
 var CELL_MAX = 45000;                 // a Sheets cell holds 50,000 characters; keep a margin
@@ -952,7 +952,10 @@ function analysts_(ticker, mode, refresh) {
   var pf = (demo || st)[bookKey(marketOf(ticker))] || { positions: [] };
   var digest = (demo && demo.digest) || st.digest;
   var position = (pf.positions || []).filter(function (p) { return String(p.ticker).toUpperCase() === ticker; })[0] || null;
-  var ind = indicators(getCandles_(ticker, '1y').candles);
+  var candles;
+  try { candles = getCandles_(ticker, '1y'); }
+  catch (e) { Utilities.sleep(1200); candles = getCandles_(ticker, '1y'); }   // Yahoo hiccups: one retry
+  var ind = indicators(candles.candles);
   if (!ind) throw apiError_('candles_failed', 'אין נתוני מחיר ל-' + ticker);
   var verdict = digest && digest.positions ? digest.positions.filter(function (v) { return v.ticker === ticker; })[0] || null : null;
   var ctx = { ticker: ticker, position: position, ind: ind, portfolioTotal: pf.totalPortfolioValue, cash: pf.cashBalance, verdict: verdict, market: digest && digest.marketSummary };
@@ -964,10 +967,16 @@ function analysts_(ticker, mode, refresh) {
     return geminiGenerate_(req, { json: true });
   };
   var r, usedSearch = search;
-  try { r = call(search); }
-  catch (e) {
-    if (!search || /gemini_auth|gemini_no_key/.test(e.message)) throw e;
-    usedSearch = false; r = call(false);
+  try {
+    try { r = call(search); }
+    catch (e) {
+      if (!search || /gemini_auth|gemini_no_key/.test(e.message)) throw e;
+      usedSearch = false; r = call(false);
+    }
+  } catch (e2) {
+    // Gemini busy or out of quota: serve the last good analysis (up to 6h) instead of an error
+    if (cache) { try { var old = cache.get('an1s:' + key); if (old) { var o = JSON.parse(old); o.stale = true; return o; } } catch (e3) { /* no copy */ } }
+    throw e2;
   }
   var chunks = (r.grounding && r.grounding.groundingChunks) || [], seen = {};
   var out = {
@@ -976,7 +985,7 @@ function analysts_(ticker, mode, refresh) {
     sources: chunks.filter(function (c) { return c.web && c.web.uri && !seen[c.web.uri] && (seen[c.web.uri] = true); })
       .slice(0, 6).map(function (c) { return { title: c.web.title || c.web.uri, url: c.web.uri }; })
   };
-  if (cache) { try { cache.put(key, JSON.stringify(out), 3 * 3600); } catch (e) { /* too big for the cache: fine */ } }
+  if (cache) { try { var js = JSON.stringify(out); cache.put(key, js, 3 * 3600); cache.put('an1s:' + key, js, 6 * 3600); } catch (e) { /* too big for the cache: fine */ } }
   return out;
 }
 
@@ -1962,7 +1971,7 @@ const TASE_SYMBOLS = {
   'עזריאלי': 'AZRG.TA', 'עזריאלי קבוצה': 'AZRG.TA',
   'הפניקס': 'PHOE.TA', 'הראל': 'HARL.TA', 'הראל השקעות': 'HARL.TA',
   'שופרסל': 'SAE.TA', 'שטראוס': 'STRS.TA', 'דלק קבוצה': 'DLEKG.TA',
-  'ארית': 'ARIT.TA', 'ארית תעשיות': 'ARIT.TA', 'ARIT': 'ARIT.TA',
+  'ארית': 'ARYT.TA', 'ארית תעשיות': 'ARYT.TA', 'ARIT': 'ARYT.TA', 'ARYT': 'ARYT.TA',
   'אורמת': 'ORA.TA', 'אורמת טכנו': 'ORA.TA',
   'מליסרון': 'MLSR.TA', 'אמות': 'AMOT.TA', 'ביג': 'BIG.TA',
   'שיכון ובינוי': 'SKBN.TA', 'אלוני חץ': 'ALHE.TA',
@@ -2021,6 +2030,7 @@ function repairILBook(book) {
   let changed = false;
   const positions = book.positions.map(p0 => {
     let p = p0;
+    if (p.ticker === 'ARIT.TA') { p = { ...p, ticker: 'ARYT.TA' }; changed = true; }   // Arit trades as ARYT
     // a Hebrew name saved as the ticker (imported before the name map): give it its .TA symbol
     if (/[^\x20-\x7E]/.test(String(p.ticker || ''))) {
       const sym = taseSymbol({ companyName: p.companyName || String(p.ticker).replace(/\./g, ' ') });

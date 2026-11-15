@@ -280,7 +280,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.4.0";
+var APP_VERSION = "6.5.0";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -2100,7 +2100,345 @@ function TodayPlan({ rows, digest, digestState, verdictOf, onOpen, onRun, canRun
     openGroup && /* @__PURE__ */ jsx(PlanSheet, { group: openGroup, doneNow, onToggle: toggle, onOpen, onClose: () => setOpenKind(null) })
   ] });
 }
-function DashboardTab({ portfolio, rows, stats, digest, digestState, verdictOf, full, setFull, onImport, onOpen, onRun, canRun, isDemo = false, showMarket = false }) {
+var LS_DASH_SORT = "swingpulse.dashSort";
+var RATING_RANK = { BUY: 5, ADD: 4, HOLD: 3, TRIM: 2, TAKE_PROFIT: 1, CUT_LOSS: 0 };
+var CONF_RANK = { high: 2, medium: 1, low: 0 };
+var POSITION_SORTS = [
+  { id: "value", label: "שווי", key: (p) => p.value ?? -Infinity },
+  { id: "ticker", label: "טיקר (A-Z)", key: (p) => String(p.ticker), text: true, dir: "asc" },
+  { id: "day", label: "שינוי יומי", key: (p) => p.live?.dayChangePct ?? -Infinity },
+  { id: "since", label: "טווח זמן · מהקנייה", key: (p) => p.pnlPct ?? -Infinity },
+  { id: "qty", label: "כמות", key: (p) => Number(p.shares) || 0 },
+  { id: "rating", label: "איכות / דירוג Gemini", key: (p, v) => v ? (RATING_RANK[v.action] ?? 2) * 3 + (CONF_RANK[v.confidence] ?? 1) : -1 }
+];
+function sortPositions(rows, sort, verdictOf) {
+  const o = POSITION_SORTS.find((x) => x.id === sort.key) || POSITION_SORTS[0];
+  const sign = sort.dir === "asc" ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    const x = o.key(a, verdictOf(a.ticker)), y = o.key(b, verdictOf(b.ticker));
+    const d = o.text ? x.localeCompare(y, "en") : x - y;
+    return sign * (d || 0) || String(a.ticker).localeCompare(String(b.ticker), "en");
+  });
+}
+function SortSheet({ sort, onChange, onClose }) {
+  const ref = useDialog(true);
+  const [closing, setClosing] = useState(false);
+  const close = useCallback(() => {
+    setClosing(true);
+    setTimeout(onClose, 200);
+  }, [onClose]);
+  useEffect(() => {
+    const k = (e) => {
+      if (e.key === "Escape") close();
+    };
+    document.addEventListener("keydown", k);
+    return () => document.removeEventListener("keydown", k);
+  }, [close]);
+  const pick = (id) => {
+    const o = POSITION_SORTS.find((x) => x.id === id);
+    onChange((s) => ({ key: id, dir: s.key === id ? s.dir : o.dir || "desc" }));
+    setTimeout(close, 160);
+  };
+  return /* @__PURE__ */ jsx(
+    "div",
+    {
+      dir: "rtl",
+      "data-closing": closing ? "" : void 0,
+      className: "sp-overlay fixed inset-0 z-[60] flex items-end justify-center sm:items-center sm:p-4",
+      onClick: (e) => {
+        if (e.target === e.currentTarget) close();
+      },
+      children: /* @__PURE__ */ jsxs(
+        "div",
+        {
+          ref,
+          role: "dialog",
+          "aria-modal": "true",
+          "aria-labelledby": "sort-title",
+          "data-closing": closing ? "" : void 0,
+          tabIndex: -1,
+          className: "sp-sheet m-3 w-full max-w-md overflow-hidden rounded-[22px] border border-[color:var(--line)] bg-[color:var(--sheet)] pb-[env(safe-area-inset-bottom)] shadow-2xl outline-none",
+          children: [
+            /* @__PURE__ */ jsx("h2", { id: "sort-title", className: "px-5 pb-2 pt-5 text-base font-bold", children: "מיון לפי:" }),
+            /* @__PURE__ */ jsx("ul", { role: "radiogroup", "aria-labelledby": "sort-title", children: POSITION_SORTS.map((o, i) => {
+              const on = sort.key === o.id;
+              return /* @__PURE__ */ jsx("li", { className: i ? "border-t border-[color:var(--line)]" : "", children: /* @__PURE__ */ jsxs(
+                "button",
+                {
+                  type: "button",
+                  role: "radio",
+                  "aria-checked": on,
+                  onClick: () => pick(o.id),
+                  className: `sp-press-soft flex min-h-[52px] w-full items-center justify-between gap-3 px-5 text-right ${on ? "font-semibold" : ""}`,
+                  children: [
+                    /* @__PURE__ */ jsx("span", { children: o.label }),
+                    /* @__PURE__ */ jsx(
+                      "svg",
+                      {
+                        viewBox: "0 0 24 24",
+                        "aria-hidden": "true",
+                        className: `h-5 w-5 flex-none text-[#ff9f0a] transition-[opacity,transform] duration-200 ${on ? "scale-100 opacity-100" : "scale-50 opacity-0"}`,
+                        fill: "none",
+                        stroke: "currentColor",
+                        strokeWidth: "2.6",
+                        strokeLinecap: "round",
+                        strokeLinejoin: "round",
+                        children: /* @__PURE__ */ jsx("path", { d: "M5 12.5l4.5 4.5L19 7.5" })
+                      }
+                    )
+                  ]
+                }
+              ) }, o.id);
+            }) }),
+            /* @__PURE__ */ jsx("div", { className: "flex gap-2 border-t border-[color:var(--line)] px-5 py-4", role: "group", "aria-label": "סדר", children: [["desc", "מהגבוה לנמוך"], ["asc", "מהנמוך לגבוה"]].map(([d, label]) => /* @__PURE__ */ jsx(
+              "button",
+              {
+                type: "button",
+                "aria-pressed": sort.dir === d,
+                onClick: () => onChange((s) => ({ ...s, dir: d })),
+                className: `sp-press min-h-10 flex-1 rounded-xl border text-sm ${sort.dir === d ? "border-[#ff9f0a] bg-[#ff9f0a]/10 font-semibold" : "border-[color:var(--line)] text-[color:var(--fg-2)]"}`,
+                children: label
+              },
+              d
+            )) })
+          ]
+        }
+      )
+    }
+  );
+}
+function useLongPress(onLong, ms = 450) {
+  const st = useRef(null);
+  const cancel = () => {
+    if (st.current?.timer) clearTimeout(st.current.timer);
+    st.current?.el?.removeAttribute("data-holding");
+  };
+  return {
+    onPointerDown: (e) => {
+      if (e.button > 0) return;
+      const el = e.currentTarget;
+      el.setAttribute("data-holding", "");
+      st.current = {
+        x: e.clientX,
+        y: e.clientY,
+        el,
+        fired: false,
+        timer: setTimeout(() => {
+          st.current.fired = true;
+          st.current.at = Date.now();
+          el.removeAttribute("data-holding");
+          try {
+            navigator.vibrate?.(12);
+          } catch {
+          }
+          onLong();
+        }, ms)
+      };
+    },
+    onPointerMove: (e) => {
+      const s0 = st.current;
+      if (s0 && !s0.fired && Math.hypot(e.clientX - s0.x, e.clientY - s0.y) > 10) cancel();
+    },
+    onPointerUp: cancel,
+    onPointerLeave: cancel,
+    onPointerCancel: cancel,
+    onContextMenu: (e) => {
+      e.preventDefault();
+      if (!(st.current?.fired && Date.now() - st.current.at < 800)) onLong();
+    },
+    swallowClick: () => {
+      const s0 = st.current;
+      const hit = !!(s0?.fired && Date.now() - s0.at < 800);
+      if (hit) st.current = null;
+      return hit;
+    }
+  };
+}
+function Sparkline({ values, buy }) {
+  if (!values || values.length < 2) return /* @__PURE__ */ jsx("div", { className: "h-[120px] animate-pulse rounded-xl bg-[color:var(--inset)]" });
+  const W = 320, H = 120, P = 6;
+  const lo = Math.min(...values), hi = Math.max(...values), span = hi - lo || 1;
+  const x = (i) => P + i / (values.length - 1) * (W - 2 * P);
+  const y = (v) => P + (1 - (v - lo) / span) * (H - 2 * P);
+  const pts = values.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const up = values.at(-1) >= values[0], c = up ? "var(--up)" : "var(--down)";
+  const showBuy = buy != null && buy >= lo && buy <= hi;
+  return /* @__PURE__ */ jsxs("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", className: "block h-[120px] w-full", role: "img", "aria-label": up ? "גרף בעלייה בטווח" : "גרף בירידה בטווח", children: [
+    /* @__PURE__ */ jsx("defs", { children: /* @__PURE__ */ jsxs("linearGradient", { id: "sp-spark", x1: "0", y1: "0", x2: "0", y2: "1", children: [
+      /* @__PURE__ */ jsx("stop", { offset: "0", stopColor: c, stopOpacity: ".22" }),
+      /* @__PURE__ */ jsx("stop", { offset: "1", stopColor: c, stopOpacity: "0" })
+    ] }) }),
+    /* @__PURE__ */ jsx("polygon", { points: `${P},${H} ${pts} ${W - P},${H}`, fill: "url(#sp-spark)" }),
+    showBuy && /* @__PURE__ */ jsx("line", { x1: P, x2: W - P, y1: y(buy), y2: y(buy), stroke: "#ff9f0a", strokeWidth: "1.2", strokeDasharray: "4 4", vectorEffect: "non-scaling-stroke" }),
+    /* @__PURE__ */ jsx("polyline", { points: pts, fill: "none", stroke: c, strokeWidth: "2", strokeLinejoin: "round", strokeLinecap: "round", vectorEffect: "non-scaling-stroke" }),
+    /* @__PURE__ */ jsx("circle", { cx: x(values.length - 1), cy: y(values.at(-1)), r: "3.5", fill: c })
+  ] });
+}
+var PEEK_RANGES = [["5", "שבוע"], ["21", "חודש"], ["63", "3 חודשים"]];
+function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
+  const ref = useDialog(true);
+  const [closing, setClosing] = useState(false);
+  const [range, setRange] = useState("21");
+  const [closes, setCloses] = useState(null);
+  const [err, setErr] = useState("");
+  const close = useCallback(() => {
+    setClosing(true);
+    setTimeout(onClose, 200);
+  }, [onClose]);
+  useEffect(() => {
+    const k = (e) => {
+      if (e.key === "Escape") close();
+    };
+    document.addEventListener("keydown", k);
+    return () => document.removeEventListener("keydown", k);
+  }, [close]);
+  useEffect(() => {
+    let alive = true;
+    fetchCandles(p.ticker, "3mo").then((r) => {
+      if (alive) setCloses((r.candles || []).map((c) => c.c));
+    }).catch((e) => {
+      if (alive) setErr(e.message || "אין נתוני גרף");
+    });
+    return () => {
+      alive = false;
+    };
+  }, [p.ticker]);
+  const vals = closes ? [...closes.slice(-Number(range)), p.currentPrice].filter(Number.isFinite) : null;
+  const rangeChg = vals && vals.length > 1 ? (vals.at(-1) / vals[0] - 1) * 100 : null;
+  const day = p.live?.dayChangePct;
+  const tv = tvSymbol(p.ticker, p.live?.exchange);
+  const tvUrl = /^\d+$/.test(String(p.ticker)) ? null : `https://www.tradingview.com/symbols/${tv.replace(":", "-")}/`;
+  const tone = (n2) => (n2 ?? 0) >= 0 ? "text-[color:var(--up)]" : "text-[color:var(--down)]";
+  return /* @__PURE__ */ jsx(
+    "div",
+    {
+      dir: "rtl",
+      "data-closing": closing ? "" : void 0,
+      className: "sp-overlay fixed inset-0 z-[60] flex items-end justify-center sm:items-center sm:p-4",
+      onClick: (e) => {
+        if (e.target === e.currentTarget) close();
+      },
+      children: /* @__PURE__ */ jsxs(
+        "div",
+        {
+          ref,
+          role: "dialog",
+          "aria-modal": "true",
+          "aria-label": `פרטים מהירים ${p.ticker}`,
+          "data-closing": closing ? "" : void 0,
+          tabIndex: -1,
+          className: "sp-sheet m-3 flex max-h-[90dvh] w-full max-w-md flex-col overflow-auto rounded-[22px] border border-[color:var(--line)] bg-[color:var(--sheet)] pb-[env(safe-area-inset-bottom)] shadow-2xl outline-none",
+          children: [
+            /* @__PURE__ */ jsxs("div", { className: "flex items-start gap-3 px-5 pb-1 pt-5", children: [
+              /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
+                /* @__PURE__ */ jsx("b", { dir: "ltr", className: "text-2xl font-bold tracking-tight", children: p.ticker }),
+                /* @__PURE__ */ jsxs("div", { className: "truncate text-xs text-[color:var(--fg-3)]", children: [
+                  p.companyName && p.companyName !== p.ticker ? `${p.companyName} · ` : "",
+                  /* @__PURE__ */ jsx("span", { dir: "ltr", children: tv })
+                ] })
+              ] }),
+              /* @__PURE__ */ jsxs("div", { className: "ms-auto text-left", children: [
+                /* @__PURE__ */ jsx("b", { className: "block text-xl", children: /* @__PURE__ */ jsx(Num, { children: money(p.currentPrice, currency, 2) }) }),
+                day != null && /* @__PURE__ */ jsxs(Num, { className: `text-sm ${tone(day)}`, children: [
+                  signedPct(day),
+                  " היום"
+                ] })
+              ] }),
+              /* @__PURE__ */ jsx("button", { type: "button", onClick: close, "aria-label": "סגירה", className: "grid h-9 w-9 flex-none place-items-center rounded-full bg-[color:var(--inset)]", children: /* @__PURE__ */ jsx(Icon, { name: "x", className: "h-4 w-4" }) })
+            ] }),
+            /* @__PURE__ */ jsxs("div", { className: "px-5 pt-2", children: [
+              err ? /* @__PURE__ */ jsx("div", { className: "grid h-[120px] place-items-center rounded-xl bg-[color:var(--inset)] text-sm text-[color:var(--fg-3)]", children: err }) : /* @__PURE__ */ jsx(Sparkline, { values: vals, buy: p.avgPrice }),
+              /* @__PURE__ */ jsxs("div", { className: "mt-2 flex items-center gap-1.5", role: "group", "aria-label": "טווח גרף", children: [
+                PEEK_RANGES.map(([n2, label]) => /* @__PURE__ */ jsx(
+                  "button",
+                  {
+                    type: "button",
+                    "aria-pressed": range === n2,
+                    onClick: () => setRange(n2),
+                    className: `sp-press min-h-8 flex-1 rounded-lg border text-xs ${range === n2 ? "border-[#ff9f0a] bg-[#ff9f0a]/10 font-bold" : "border-[color:var(--line)] text-[color:var(--fg-2)]"}`,
+                    children: label
+                  },
+                  n2
+                )),
+                rangeChg != null && /* @__PURE__ */ jsx(Num, { className: `ms-1 min-w-[4.5rem] text-left text-sm font-semibold ${tone(rangeChg)}`, children: signedPct(rangeChg) })
+              ] })
+            ] }),
+            /* @__PURE__ */ jsx("div", { className: "grid grid-cols-2 gap-2 px-5 pt-4", children: [
+              ["מחיר קנייה", /* @__PURE__ */ jsx(Num, { children: money(p.avgPrice, currency, 2) })],
+              ["כמות בתיק", /* @__PURE__ */ jsx(Num, { children: qty(p.shares) })],
+              ["שווי", /* @__PURE__ */ jsx(Num, { children: money(p.value, currency) })],
+              ["רווח/הפסד", /* @__PURE__ */ jsxs(Num, { className: tone(p.pnl), children: [
+                signedMoney(p.pnl, currency),
+                " (",
+                signedPct(p.pnlPct),
+                ")"
+              ] })]
+            ].map(([k, v]) => /* @__PURE__ */ jsxs("div", { className: "rounded-2xl bg-[color:var(--inset)] px-3 py-2.5", children: [
+              /* @__PURE__ */ jsx("span", { className: "block text-xs text-[color:var(--fg-3)]", children: k }),
+              /* @__PURE__ */ jsx("b", { className: "text-base", children: v })
+            ] }, k)) }),
+            verdict && /* @__PURE__ */ jsxs("p", { className: "px-5 pt-3 text-sm", children: [
+              /* @__PURE__ */ jsx(ActionBadge, { action: verdict.action }),
+              " ",
+              /* @__PURE__ */ jsx("span", { className: "ms-1", children: verdict.verdict })
+            ] }),
+            /* @__PURE__ */ jsxs("div", { className: "flex gap-2 px-5 pb-5 pt-4", children: [
+              /* @__PURE__ */ jsx(
+                "button",
+                {
+                  type: "button",
+                  onClick: () => {
+                    close();
+                    setTimeout(onOpenFull, 210);
+                  },
+                  className: "sp-press min-h-11 flex-1 rounded-xl bg-[#0a84ff] text-sm font-semibold text-white",
+                  children: "פתח מסך מלא · גרף TradingView"
+                }
+              ),
+              tvUrl && /* @__PURE__ */ jsx("a", { href: tvUrl, target: "_blank", rel: "noopener", className: "sp-press grid min-h-11 place-items-center rounded-xl border border-[color:var(--line-2)] px-3 text-sm", children: "TradingView ↗" })
+            ] })
+          ]
+        }
+      )
+    }
+  );
+}
+function PositionCard({ onOpen, onPeek, className, children }) {
+  const lp = useLongPress(onPeek);
+  const { swallowClick, ...handlers } = lp;
+  return /* @__PURE__ */ jsx(
+    "article",
+    {
+      role: "button",
+      tabIndex: 0,
+      ...handlers,
+      "aria-description": "לחיצה ארוכה לפרטים מהירים",
+      onClick: () => {
+        if (!swallowClick()) onOpen();
+      },
+      onKeyDown: (e) => {
+        if (e.key === "Enter") onOpen();
+        if (e.key === " " || e.key === "ContextMenu") {
+          e.preventDefault();
+          onPeek();
+        }
+      },
+      className: `${className} select-none [-webkit-touch-callout:none] [touch-action:pan-y] data-[holding]:scale-[.975] data-[holding]:duration-500`,
+      children
+    }
+  );
+}
+function DashboardTab({ portfolio, rows: rowsIn, stats, digest, digestState, verdictOf, full, setFull, onImport, onOpen, onRun, canRun, isDemo = false, showMarket = false }) {
+  const [psort, setPsortRaw] = useState(() => loadJSON(LS_DASH_SORT, { key: "value", dir: "desc" }));
+  const setPsort = useCallback((fn) => setPsortRaw((s) => {
+    const n2 = typeof fn === "function" ? fn(s) : fn;
+    saveJSON(LS_DASH_SORT, n2);
+    return n2;
+  }), []);
+  const [sortOpen, setSortOpen] = useState(false);
+  const [peek, setPeek] = useState(null);
+  const rows = useMemo(() => sortPositions(rowsIn, psort, verdictOf), [rowsIn, psort, verdictOf]);
+  const sortLabel = (POSITION_SORTS.find((o) => o.id === psort.key) || POSITION_SORTS[0]).label;
   const cur = portfolio.currency || "USD";
   const notes = cleanNotes([
     ...(portfolio.meta?.failedChunks || []).map((f) => `צילומים ${f.screenshots?.[0]}–${f.screenshots?.[1]} לא פוענחו — העלו אותם שוב עם "הוסף לתיק הקיים"`),
@@ -2180,6 +2518,20 @@ function DashboardTab({ portfolio, rows, stats, digest, digestState, verdictOf, 
     /* @__PURE__ */ jsxs("section", { className: "flex flex-col gap-3", children: [
       /* @__PURE__ */ jsxs("div", { className: "flex flex-wrap items-center gap-3", children: [
         /* @__PURE__ */ jsx("h2", { className: "text-lg font-bold", children: "תיק השקעות פעיל" }),
+        /* @__PURE__ */ jsxs(
+          "button",
+          {
+            type: "button",
+            onClick: () => setSortOpen(true),
+            "aria-haspopup": "dialog",
+            className: "sp-press inline-flex min-h-9 items-center gap-1.5 rounded-full border border-[color:var(--line)] bg-[color:var(--card)] px-3 text-xs font-semibold",
+            children: [
+              /* @__PURE__ */ jsx("svg", { viewBox: "0 0 24 24", "aria-hidden": "true", className: "h-3.5 w-3.5", fill: "none", stroke: "currentColor", strokeWidth: "2", strokeLinecap: "round", children: /* @__PURE__ */ jsx("path", { d: "M7 4v16M3 16l4 4 4-4M17 20V4M13 8l4-4 4 4" }) }),
+              sortLabel,
+              /* @__PURE__ */ jsx("span", { className: "text-[color:var(--fg-3)]", children: psort.dir === "asc" ? "↑" : "↓" })
+            ]
+          }
+        ),
         /* @__PURE__ */ jsx(
           Segmented,
           {
@@ -2196,14 +2548,10 @@ function DashboardTab({ portfolio, rows, stats, digest, digestState, verdictOf, 
         const v = verdictOf(p.ticker);
         const tone = v ? ACTIONS[v.action]?.tone || "gray" : "gray";
         return /* @__PURE__ */ jsxs(
-          "article",
+          PositionCard,
           {
-            role: "button",
-            tabIndex: 0,
-            onClick: () => onOpen?.(p.ticker),
-            onKeyDown: (e) => {
-              if (e.key === "Enter") onOpen?.(p.ticker);
-            },
+            onOpen: () => onOpen?.(p.ticker),
+            onPeek: () => setPeek(p),
             className: `flex min-w-0 cursor-pointer flex-col gap-3 rounded-2xl border border-[color:var(--line)] border-r-4 bg-[color:var(--card)] p-4 transition hover:-translate-y-0.5 hover:bg-[color:var(--card-hover)] ${EDGE_CLASSES[tone]}`,
             children: [
               /* @__PURE__ */ jsxs("div", { className: "flex items-start gap-2", children: [
@@ -2264,7 +2612,18 @@ function DashboardTab({ portfolio, rows, stats, digest, digestState, verdictOf, 
           },
           p.ticker
         );
-      }) })
+      }) }),
+      sortOpen && /* @__PURE__ */ jsx(SortSheet, { sort: psort, onChange: setPsort, onClose: () => setSortOpen(false) }),
+      peek && /* @__PURE__ */ jsx(
+        QuickPeek,
+        {
+          position: peek,
+          verdict: verdictOf(peek.ticker),
+          currency: peek.nativeCurrency || (marketOf(peek.ticker) === "IL" ? "ILS" : cur),
+          onClose: () => setPeek(null),
+          onOpenFull: () => onOpen?.(peek.ticker)
+        }
+      )
     ] }),
     notes.length > 0 && /* @__PURE__ */ jsx(Accordion, { title: `הערות פענוח (${notes.length})`, defaultOpen: (portfolio.meta?.failedChunks?.length || 0) + (portfolio.meta?.unreadable?.length || 0) > 0, children: /* @__PURE__ */ jsx("ul", { dir: "rtl", className: "sp-list text-[color:var(--fg-2)]", style: { "--marker": "var(--warn)" }, children: notes.map((t, i) => /* @__PURE__ */ jsx("li", { dir: "rtl", children: t }, i)) }) }),
     digest?.sources?.length > 0 && /* @__PURE__ */ jsxs("section", { className: "rounded-2xl border border-[color:var(--line)] bg-[color:var(--card)] p-4 text-sm", children: [
@@ -3925,10 +4284,24 @@ function AnalystPanel({ ticker, mode, position, demoStats, onDemoApplied }) {
   const [msg, setMsg] = useState("");
   const load = useCallback(async (refresh) => {
     setState((s) => ({ ...s, loading: true, error: "" }));
-    try {
-      setState({ loading: false, error: "", data: await demoApi.analysts(ticker, mode, refresh) });
-    } catch (e) {
-      setState({ loading: false, error: e.code === "gemini_no_key" ? "חסר מפתח Gemini בהגדרות." : e.message || "הניתוח נכשל", data: null });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        setState({ loading: false, error: "", data: await demoApi.analysts(ticker, mode, refresh) });
+        return;
+      } catch (e) {
+        const final = attempt === 1 || ["gemini_no_key", "gemini_auth", "login_required", "bad_request"].includes(e.code);
+        if (!final) {
+          await new Promise((r) => setTimeout(r, 2500));
+          continue;
+        }
+        const quota = /quota|429|RESOURCE_EXHAUSTED|busy/i.test(`${e.code} ${e.message}`);
+        setState((s) => ({
+          loading: false,
+          data: s.data,
+          error: e.code === "gemini_no_key" ? "חסר מפתח Gemini בהגדרות." : quota ? "Gemini עמוס כרגע או שהמכסה היומית נגמרה. נסו שוב בעוד כמה דקות." : e.message || "הניתוח נכשל"
+        }));
+        return;
+      }
     }
   }, [ticker, mode]);
   useEffect(() => {
@@ -3976,6 +4349,11 @@ function AnalystPanel({ ticker, mode, position, demoStats, onDemoApplied }) {
     ] }, k)) }),
     state.loading && !state.data && /* @__PURE__ */ jsx("ul", { className: "flex flex-col gap-2", "aria-busy": "true", children: [0, 1, 2, 3].map((i) => /* @__PURE__ */ jsx("li", { className: "h-14 animate-pulse rounded-2xl bg-[color:var(--inset)]" }, i)) }),
     state.error && /* @__PURE__ */ jsx("p", { className: "text-sm text-[color:var(--down)]", children: state.error }),
+    state.data?.stale && !state.error && /* @__PURE__ */ jsxs("p", { className: "text-xs text-[color:var(--fg-3)]", children: [
+      "Gemini עמוס כרגע, מוצג הניתוח האחרון מ-",
+      timeFmt(state.data.at),
+      "."
+    ] }),
     state.data && /* @__PURE__ */ jsx("ul", { className: "sp-stagger flex flex-col gap-2", children: state.data.analysts.map((a) => {
       const open = openId === a.id;
       const trade = mode === "demo" ? demoTradeFor(a.action, position || { ticker }, price, demoStats) : null;
