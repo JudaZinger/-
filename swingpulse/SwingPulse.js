@@ -280,7 +280,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.7.1";
+var APP_VERSION = "6.7.2";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -2385,8 +2385,8 @@ function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
         setCloses((r.candles || []).map((c) => c.c));
         setSample(!!r.sample);
       }
-    }).catch((e) => {
-      if (alive) setErr(e.message || "אין נתוני גרף");
+    }).catch(() => {
+      if (alive) setErr("אין גרף זמין לנייר הזה");
     });
     return () => {
       alive = false;
@@ -2395,6 +2395,9 @@ function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
   const vals = closes ? [...closes.slice(-Number(range)), p.currentPrice].filter(Number.isFinite) : null;
   const rangeChg = vals && vals.length > 1 ? (vals.at(-1) / vals[0] - 1) * 100 : null;
   const day = p.live?.dayChangePct;
+  const sh = Number(p.shares) || 0;
+  const nValue = Number.isFinite(p.currentPrice) ? sh * p.currentPrice : p.value;
+  const nPnl = Number.isFinite(p.currentPrice) && Number.isFinite(p.avgPrice) ? sh * (p.currentPrice - p.avgPrice) : p.pnl;
   const tv = tvSymbol(p.ticker, p.live?.exchange);
   const tvUrl = /^\d+$/.test(String(p.ticker)) ? null : `https://www.tradingview.com/symbols/${tv.replace(":", "-")}/`;
   const tone = (n2) => (n2 ?? 0) >= 0 ? "text-[color:var(--up)]" : "text-[color:var(--down)]";
@@ -2437,7 +2440,7 @@ function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
             ] }),
             /* @__PURE__ */ jsxs("div", { className: "px-5 pt-2", children: [
               err ? /* @__PURE__ */ jsx("div", { className: "grid h-[120px] place-items-center rounded-xl bg-[color:var(--inset)] text-sm text-[color:var(--fg-3)]", children: err }) : /* @__PURE__ */ jsx(Sparkline, { values: vals, buy: p.avgPrice }),
-              /* @__PURE__ */ jsxs("div", { className: "mt-2 flex items-center gap-1.5", role: "group", "aria-label": "טווח גרף", children: [
+              /* @__PURE__ */ jsxs("div", { className: `mt-2 items-center gap-1.5 ${err ? "hidden" : "flex"}`, role: "group", "aria-label": "טווח גרף", children: [
                 PEEK_RANGES.map(([n2, label]) => /* @__PURE__ */ jsx(
                   "button",
                   {
@@ -2456,9 +2459,9 @@ function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
             /* @__PURE__ */ jsx("div", { className: "grid grid-cols-2 gap-2 px-5 pt-4", children: [
               ["מחיר קנייה", /* @__PURE__ */ jsx(Num, { children: money(p.avgPrice, currency, 2) })],
               ["כמות בתיק", /* @__PURE__ */ jsx(Num, { children: qty(p.shares) })],
-              ["שווי", /* @__PURE__ */ jsx(Num, { children: money(p.value, currency) })],
-              ["רווח/הפסד", /* @__PURE__ */ jsxs(Num, { className: tone(p.pnl), children: [
-                signedMoney(p.pnl, currency),
+              ["שווי", /* @__PURE__ */ jsx(Num, { children: money(nValue, currency) })],
+              ["רווח/הפסד", /* @__PURE__ */ jsxs(Num, { className: tone(nPnl), children: [
+                signedMoney(nPnl, currency),
                 " (",
                 signedPct(p.pnlPct),
                 ")"
@@ -2482,7 +2485,7 @@ function QuickPeek({ position: p, verdict, currency, onClose, onOpenFull }) {
                     setTimeout(onOpenFull, 210);
                   },
                   className: "sp-press min-h-11 flex-1 rounded-xl bg-[#0a84ff] text-sm font-semibold text-white",
-                  children: "פתח מסך מלא · גרף TradingView"
+                  children: tvUrl ? "פתח מסך מלא · גרף TradingView" : "פתח מסך מלא"
                 }
               ),
               tvUrl && /* @__PURE__ */ jsx("a", { href: tvUrl, target: "_blank", rel: "noopener", className: "sp-press grid min-h-11 place-items-center rounded-xl border border-[color:var(--line-2)] px-3 text-sm", children: "TradingView ↗" })
