@@ -280,7 +280,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.5.1";
+var APP_VERSION = "6.6.0";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -1184,6 +1184,21 @@ function Pill({ tone = "gray", children, title }) {
     /* @__PURE__ */ jsx("span", { className: "h-1.5 w-1.5 rounded-full bg-current" }),
     children
   ] });
+}
+function gradeOf(v) {
+  if (!v) return null;
+  const strong = v.confidence === "high";
+  if (v.action === "BUY" || v.action === "ADD") return strong ? "S" : "A";
+  if (v.action === "HOLD") return v.confidence === "low" ? "C" : "B";
+  if (v.action === "TRIM" || v.action === "TAKE_PROFIT") return "C";
+  if (v.action === "CUT_LOSS") return "D";
+  return null;
+}
+var GRADE_TONE = { S: "green", A: "green", B: "blue", C: "yellow", D: "red" };
+function GradeBadge({ verdict }) {
+  const g = gradeOf(verdict);
+  if (!g) return null;
+  return /* @__PURE__ */ jsx("span", { "aria-label": `דירוג ${g}`, title: "דירוג לפי ההמלצה של Gemini", className: `inline-grid h-5 min-w-5 flex-none place-items-center rounded-md px-1 text-[11px] font-extrabold ${TONE_CLASSES[GRADE_TONE[g]]}`, children: g });
 }
 function ActionBadge({ action, waiting = false, showDetail = false }) {
   const a = ACTIONS[action];
@@ -2133,6 +2148,63 @@ function sortPositions(rows, sort, verdictOf) {
     return sign * (d || 0) || String(a.ticker).localeCompare(String(b.ticker), "en");
   });
 }
+function ActionSheet({ actions, onClose }) {
+  const ref = useDialog(true);
+  const [closing, setClosing] = useState(false);
+  const close = useCallback(() => {
+    setClosing(true);
+    setTimeout(onClose, 200);
+  }, [onClose]);
+  useEffect(() => {
+    const k = (e) => {
+      if (e.key === "Escape") close();
+    };
+    document.addEventListener("keydown", k);
+    return () => document.removeEventListener("keydown", k);
+  }, [close]);
+  return /* @__PURE__ */ jsx(
+    "div",
+    {
+      dir: "rtl",
+      "data-closing": closing ? "" : void 0,
+      className: "sp-overlay fixed inset-0 z-[60] flex items-end justify-center",
+      onClick: (e) => {
+        if (e.target === e.currentTarget) close();
+      },
+      children: /* @__PURE__ */ jsx(
+        "div",
+        {
+          ref,
+          role: "dialog",
+          "aria-modal": "true",
+          "aria-label": "פעולות",
+          "data-closing": closing ? "" : void 0,
+          tabIndex: -1,
+          className: "sp-sheet m-3 w-full max-w-md overflow-hidden rounded-[22px] border border-[color:var(--line)] bg-[color:var(--sheet)] pb-[env(safe-area-inset-bottom)] shadow-2xl outline-none",
+          children: /* @__PURE__ */ jsx("ul", { children: actions.map((a, i) => /* @__PURE__ */ jsx("li", { className: i ? "border-t border-[color:var(--line)]" : "", children: /* @__PURE__ */ jsxs(
+            "button",
+            {
+              type: "button",
+              disabled: a.disabled,
+              onClick: () => {
+                close();
+                setTimeout(a.run, 210);
+              },
+              className: "sp-press-soft flex min-h-[60px] w-full items-center gap-3 px-5 text-right disabled:opacity-45",
+              children: [
+                /* @__PURE__ */ jsx("span", { className: "grid h-9 w-9 flex-none place-items-center rounded-xl bg-[color:var(--accent-bg)] text-[color:var(--accent)]", children: /* @__PURE__ */ jsx(Icon, { name: a.icon, className: "h-4 w-4" }) }),
+                /* @__PURE__ */ jsxs("span", { className: "min-w-0", children: [
+                  /* @__PURE__ */ jsx("b", { className: "block text-[15px]", children: a.label }),
+                  /* @__PURE__ */ jsx("span", { className: "block text-xs text-[color:var(--fg-3)]", children: a.sub })
+                ] })
+              ]
+            }
+          ) }, a.label)) })
+        }
+      )
+    }
+  );
+}
 function SortSheet({ sort, onChange, onClose }) {
   const ref = useDialog(true);
   const [closing, setClosing] = useState(false);
@@ -2529,7 +2601,7 @@ function DashboardTab({ portfolio, rows: rowsIn, stats, digest, digestState, ver
           "עודכן ",
           timeFmt(digest.meta?.at || Date.now())
         ] })
-      ] }) : /* @__PURE__ */ jsx("span", { className: "text-[color:var(--fg-3)]", children: digestState.error || 'עוד אין המלצות. לחצו "המלצות Gemini" בסרגל העליון.' }) }),
+      ] }) : /* @__PURE__ */ jsx("span", { className: "text-[color:var(--fg-3)]", children: digestState.error || 'עוד אין המלצות. הריצו "המלצות Gemini" (בטלפון: כפתור +).' }) }),
       digestState.error && digest && /* @__PURE__ */ jsx("div", { className: "mt-2 text-xs text-[color:var(--down)]", children: digestState.error })
     ] }),
     /* @__PURE__ */ jsx(TodayPlan, { rows, digest, digestState, verdictOf, onOpen, onRun, canRun }),
@@ -2574,8 +2646,11 @@ function DashboardTab({ portfolio, rows: rowsIn, stats, digest, digestState, ver
             children: [
               /* @__PURE__ */ jsxs("div", { className: "flex items-start gap-2", children: [
                 /* @__PURE__ */ jsxs("div", { className: "min-w-0", children: [
-                  /* @__PURE__ */ jsx("b", { dir: "ltr", className: "text-xl", children: p.ticker }),
-                  showMarket && /* @__PURE__ */ jsx(MarketBadge, { p }),
+                  /* @__PURE__ */ jsxs("span", { className: "flex items-center gap-1.5", children: [
+                    /* @__PURE__ */ jsx("b", { dir: "ltr", className: "text-xl", children: p.ticker }),
+                    /* @__PURE__ */ jsx(GradeBadge, { verdict: v }),
+                    showMarket && /* @__PURE__ */ jsx(MarketBadge, { p })
+                  ] }),
                   /* @__PURE__ */ jsxs("div", { className: "truncate text-xs text-[color:var(--fg-3)]", children: [
                     p.companyName,
                     " · ",
@@ -4164,7 +4239,11 @@ function TradeConfirm({ result, mode, busy, error, onConfirm, onCancel }) {
     ] })
   ] });
 }
-function CommandBar({ mode, enabled, onApplied }) {
+function CommandBar({ mode, enabled, onApplied, shown = false, onDismiss }) {
+  const inputRef = useRef(null);
+  useEffect(() => {
+    if (shown) inputRef.current?.focus();
+  }, [shown]);
   const [text, setText] = useState("");
   const [phase, setPhase] = useState("idle");
   const [result, setResult] = useState(null);
@@ -4215,13 +4294,14 @@ function CommandBar({ mode, enabled, onApplied }) {
       reset();
       setFlash(result.mode === "demo" ? "תיק הדמו עודכן" : "התיק האמיתי עודכן");
       setTimeout(() => setFlash(""), 3500);
+      onDismiss?.();
     } catch (x) {
       setError(x.message || "העדכון נכשל");
       setPhase("review");
     }
   }
   if (!enabled) return null;
-  return /* @__PURE__ */ jsxs("div", { className: "fixed inset-x-0 z-30 px-3 bottom-[calc(env(safe-area-inset-bottom)+4.6rem)] md:bottom-4", children: [
+  return /* @__PURE__ */ jsxs("div", { className: `fixed inset-x-0 z-30 px-3 bottom-[calc(env(safe-area-inset-bottom)+4.6rem)] md:bottom-4`, children: [
     (phase === "review" || phase === "applying") && result && /* @__PURE__ */ jsx(
       "div",
       {
@@ -4230,6 +4310,7 @@ function CommandBar({ mode, enabled, onApplied }) {
         className: "sp-fade fixed inset-0 -z-10 bg-[color:var(--overlay)] backdrop-blur-sm"
       }
     ),
+    shown && phase === "idle" && /* @__PURE__ */ jsx("div", { "aria-hidden": "true", onClick: onDismiss, className: "sp-fade fixed inset-0 -z-10 bg-[color:var(--overlay)] md:hidden" }),
     /* @__PURE__ */ jsxs("div", { className: "mx-auto flex max-w-2xl flex-col gap-2", children: [
       (phase === "review" || phase === "applying") && result && /* @__PURE__ */ jsx("div", { className: "sp-sheet relative z-10 max-h-[60dvh] overflow-y-auto rounded-3xl border border-[color:var(--line)] bg-[color:var(--sheet)] p-4 shadow-[0_-8px_40px_rgba(0,0,0,.45)]", children: /* @__PURE__ */ jsx(TradeConfirm, { result, mode: result.mode, busy: phase === "applying", error, onConfirm: confirm, onCancel: reset }) }),
       flash && /* @__PURE__ */ jsxs("div", { className: "sp-pop self-center rounded-full px-4 py-2 text-sm font-semibold shadow-lg", style: { background: "var(--up)", color: "#fff" }, children: [
@@ -4241,7 +4322,7 @@ function CommandBar({ mode, enabled, onApplied }) {
         "form",
         {
           onSubmit: submit,
-          className: "flex items-center gap-2 rounded-2xl border bg-[color:var(--nav)] p-1.5 shadow-xl backdrop-blur-xl",
+          className: `items-center gap-2 rounded-2xl border bg-[color:var(--nav)] p-1.5 shadow-xl backdrop-blur-xl md:flex ${shown ? "flex" : "hidden"}`,
           style: { borderColor: isDemo ? "var(--warn-line)" : "var(--line-2)" },
           children: [
             /* @__PURE__ */ jsx(
@@ -4255,6 +4336,7 @@ function CommandBar({ mode, enabled, onApplied }) {
             /* @__PURE__ */ jsx(
               "input",
               {
+                ref: inputRef,
                 value: text,
                 onChange: (e) => setText(e.target.value),
                 dir: "rtl",
@@ -4680,7 +4762,12 @@ function SwingPulseApp() {
   const [serverOk, setServerOk] = useState(true);
   const [serverChecked, setServerChecked] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [fabOpen, setFabOpen] = useState(false);
+  const [cmdOpen, setCmdOpen] = useState(false);
   const [tab, setTab] = useState("dashboard");
+  useEffect(() => {
+    if (tab === "settings") setCmdOpen(false);
+  }, [tab]);
   const [full, setFull] = useState(false);
   const [settings, setSettings] = useState(() => {
     const s = loadJSON(LS_SETTINGS, {});
@@ -5150,7 +5237,7 @@ function SwingPulseApp() {
               onClick: () => isDemo ? runDemoDigest() : runDigest("manual"),
               disabled: digestState.busy || !serverOk,
               "aria-label": "המלצות Gemini",
-              className: "flex min-h-10 min-w-10 items-center justify-center gap-1.5 rounded-xl border border-[color:var(--line-2)] px-3 py-2 text-sm hover:bg-[color:var(--tint)] disabled:opacity-40",
+              className: "hidden min-h-10 min-w-10 items-center md:flex justify-center gap-1.5 rounded-xl border border-[color:var(--line-2)] px-3 py-2 text-sm hover:bg-[color:var(--tint)] disabled:opacity-40",
               children: [
                 /* @__PURE__ */ jsx(Icon, { name: "refresh", spin: digestState.busy }),
                 /* @__PURE__ */ jsx("span", { className: "hidden sm:inline", children: "המלצות Gemini" })
@@ -5163,7 +5250,7 @@ function SwingPulseApp() {
               type: "button",
               onClick: () => openImport(),
               "aria-label": "ייבוא תיק",
-              className: "flex min-h-10 min-w-10 items-center justify-center gap-1.5 rounded-xl bg-[color:var(--inverse)] px-3 py-2 text-sm font-semibold text-[color:var(--inverse-fg)]",
+              className: "hidden min-h-10 min-w-10 items-center md:flex justify-center gap-1.5 rounded-xl bg-[color:var(--inverse)] px-3 py-2 text-sm font-semibold text-[color:var(--inverse-fg)]",
               children: [
                 /* @__PURE__ */ jsx(Icon, { name: "upload" }),
                 /* @__PURE__ */ jsx("span", { className: "hidden sm:inline", children: "ייבוא תיק" })
@@ -5348,7 +5435,35 @@ function SwingPulseApp() {
             orders: (isDemo ? demo?.orders : data.orders) || []
           }
         ),
-        REMOTE && !SANDBOX && synced && tab !== "settings" && /* @__PURE__ */ jsx(CommandBar, { mode: isDemo ? "demo" : "live", enabled: !isDemo || !!demo?.zero, onApplied: onTradeApplied }),
+        REMOTE && !SANDBOX && synced && tab !== "settings" && /* @__PURE__ */ jsx(
+          CommandBar,
+          {
+            mode: isDemo ? "demo" : "live",
+            enabled: !isDemo || !!demo?.zero,
+            onApplied: onTradeApplied,
+            shown: cmdOpen,
+            onDismiss: () => setCmdOpen(false)
+          }
+        ),
+        !SANDBOX && !cmdOpen && !openTicker && /* @__PURE__ */ jsx(
+          "button",
+          {
+            type: "button",
+            onClick: () => setFabOpen(true),
+            "aria-label": "פעולות",
+            "aria-haspopup": "dialog",
+            className: "sp-press fixed bottom-[calc(env(safe-area-inset-bottom)+4.6rem)] left-4 z-30 grid h-14 w-14 place-items-center rounded-full bg-[#0a84ff] text-white shadow-[0_8px_24px_rgba(10,132,255,.4)] md:hidden",
+            children: /* @__PURE__ */ jsx("svg", { viewBox: "0 0 24 24", "aria-hidden": "true", className: "h-6 w-6", fill: "none", stroke: "currentColor", strokeWidth: "2.4", strokeLinecap: "round", children: /* @__PURE__ */ jsx("path", { d: "M12 5v14M5 12h14" }) })
+          }
+        ),
+        fabOpen && /* @__PURE__ */ jsx(ActionSheet, { onClose: () => setFabOpen(false), actions: [
+          REMOTE && synced && (!isDemo || !!demo?.zero) && { icon: "send", label: "רישום עסקה", sub: isDemo ? "כותבים מה עשית בדמו, ה-AI מעדכן" : "כותבים מה קנית או מכרת, ה-AI מעדכן", run: () => {
+            setTab((t) => t === "settings" ? "dashboard" : t);
+            setCmdOpen(true);
+          } },
+          { icon: "upload", label: "ייבוא מצילום מסך", sub: "בלינק או חשבון בנק", run: () => openImport() },
+          viewPf && { icon: "refresh", label: "המלצות Gemini", sub: digestState.busy ? "כבר רץ…" : "ניתוח מחדש של כל התיק", disabled: digestState.busy || !serverOk, run: () => isDemo ? runDemoDigest() : runDigest("manual") }
+        ].filter(Boolean) }),
         /* @__PURE__ */ jsx(
           ImportModal,
           {
