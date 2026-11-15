@@ -156,9 +156,10 @@ var TASE_SYMBOLS = {
   "שופרסל": "SAE.TA",
   "שטראוס": "STRS.TA",
   "דלק קבוצה": "DLEKG.TA",
-  "ארית": "ARIT.TA",
-  "ארית תעשיות": "ARIT.TA",
-  "ARIT": "ARIT.TA",
+  "ארית": "ARYT.TA",
+  "ארית תעשיות": "ARYT.TA",
+  "ARIT": "ARYT.TA",
+  "ARYT": "ARYT.TA",
   "אורמת": "ORA.TA",
   "אורמת טכנו": "ORA.TA",
   "מליסרון": "MLSR.TA",
@@ -195,6 +196,10 @@ function repairILBook(book) {
   let changed = false;
   const positions = book.positions.map((p0) => {
     let p = p0;
+    if (p.ticker === "ARIT.TA") {
+      p = { ...p, ticker: "ARYT.TA" };
+      changed = true;
+    }
     if (/[^\x20-\x7E]/.test(String(p.ticker || ""))) {
       const sym = taseSymbol({ companyName: p.companyName || String(p.ticker).replace(/\./g, " ") });
       if (sym && /^[\x20-\x7E]+$/.test(sym)) {
@@ -275,7 +280,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.3.2";
+var APP_VERSION = "6.3.3";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
