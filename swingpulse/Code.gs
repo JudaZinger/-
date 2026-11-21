@@ -8,7 +8,7 @@
    Secrets live in Script Properties (only the owner can read them).
    =================================================================================== */
 
-var GAS_VERSION = '6.8.1';
+var GAS_VERSION = '6.8.2';
 var DEFAULT_MODEL = 'gemini-flash-latest';
 var FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash'];
 var CELL_MAX = 45000;                 // a Sheets cell holds 50,000 characters; keep a margin
@@ -1784,7 +1784,7 @@ function cleanParsedTrades(d) {
   const trades = (Array.isArray(d && d.trades) ? d.trades : [])
     .map(t => ({ type: TRADE_TYPES.includes(t.type) ? t.type : null, ticker: T(t.ticker), shares: n(t.shares), price: n(t.price), amount: n(t.amount) }))
     .filter(t => t.type && t.ticker)
-    .slice(0, 24);
+    .slice(0, 40);
   return { trades, reply: String((d && d.reply) || '').slice(0, 300) };
 }
 
@@ -1895,7 +1895,9 @@ function recsTradesLocal(text, digest, portfolio) {
   if (!trades.length && !adds.length) return { trades: [], reply: 'לא מצאתי המלצות פתוחות לביצוע. כתבו מה קניתם או מכרתם, למשל: מכרתי את כל AMD.', local: true };
   const list = trades.map(t => `${t.type === 'SELL_ALL' ? 'מכירת כל' : 'מכירת שליש'} ${t.ticker}`).join(', ');
   const addNote = adds.length ? ` להוספה (${adds.join(', ')}) כתבו כמה קניתם.` : '';
-  return { trades: trades.slice(0, 24), reply: (list ? `לפי ההמלצות: ${list}. בדקו ואשרו.` : '') + addNote, local: true };
+  const all = trades.filter(t => t.type === 'SELL_ALL').length, part = trades.length - all;
+  const head = trades.length > 6 ? `לפי ההמלצות: ${trades.length} מכירות (${all} מלאות, ${part} של שליש). בדקו את הרשימה ואשרו.` : list ? `לפי ההמלצות: ${list}. בדקו ואשרו.` : '';
+  return { trades: trades.slice(0, 40), reply: head + addNote, local: true };
 }
 
 return { TRADE_TYPES, TRADE_HE, recomputePortfolio, previewTrade, applyTrades, TRADE_PARSE_SCHEMA, recsForPrompt, tradeParsePrompt, cleanParsedTrades, parseTradeLocal, recsTradesLocal };
