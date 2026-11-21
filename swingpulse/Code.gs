@@ -8,7 +8,7 @@
    Secrets live in Script Properties (only the owner can read them).
    =================================================================================== */
 
-var GAS_VERSION = '6.8.0';
+var GAS_VERSION = '6.8.1';
 var DEFAULT_MODEL = 'gemini-flash-latest';
 var FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash'];
 var CELL_MAX = 45000;                 // a Sheets cell holds 50,000 characters; keep a margin
@@ -808,7 +808,7 @@ function parseTrade_(text, mode) {
   var h = holderFor_(mode);
   var books = bothBooksForPrompt(h.portfolio, h.portfolioIL);
   // simple sentences ("קניתי 2 NVDA ב-180") are parsed here in milliseconds; the AI only gets what this can't read
-  var parsed = parseTradeLocal(text, books), r = { model: 'local' };
+  var parsed = recsTradesLocal(text, h.digest, books) || parseTradeLocal(text, books), r = { model: 'local' };
   if (!parsed) {
     r = geminiGenerate_({
       contents: [{ role: 'user', parts: [{ text: tradeParsePrompt(text, books, recsForPrompt(h.digest, books)) }] }],
@@ -1875,7 +1875,30 @@ function parseTradeLocal(text, portfolio) {
   return { trades, reply, local: true };
 }
 
-return { TRADE_TYPES, TRADE_HE, recomputePortfolio, previewTrade, applyTrades, TRADE_PARSE_SCHEMA, recsForPrompt, tradeParsePrompt, cleanParsedTrades, parseTradeLocal };
+/** "I did what you said": turn the latest recommendations into trades without the AI. Null when the message is not a general confirmation. */
+const DID_ALL_RE = /(?:עשיתי|ביצעתי|בוצע|ביצענו|עשינו|מכרתי|פעלתי)\s.*(?:המלצ|אמרת|הוראות|הנחי|שהצעת|שצריך|שביקשת)|^(?:בוצע|ביצעתי|עשיתי)(?:\s+(?:הכל|הכול|את\s+הכל|הכל\s+בוצע))?\s*[.!]?$/;
+function recsTradesLocal(text, digest, portfolio) {
+  const s = String(text || '').trim();
+  if (!DID_ALL_RE.test(s)) return null;
+  const held = new Map(((portfolio && portfolio.positions) || []).map(p => [String(p.ticker).toUpperCase(), p]));
+  // naming a stock means only some of them: leave it to the stock-by-stock parser or the AI
+  if (findTicker(s, [...held.values()])) return null;
+  const sellsOnly = /מכרתי|שצריך/.test(s);
+  const trades = [], adds = [];
+  for (const v of (digest && digest.positions) || []) {
+    const p = v && held.get(String(v.ticker).toUpperCase());
+    if (!p) continue;
+    if (v.action === 'TAKE_PROFIT' || v.action === 'CUT_LOSS') trades.push({ type: 'SELL_ALL', ticker: p.ticker, shares: null, price: null, amount: null });
+    else if (v.action === 'TRIM') trades.push({ type: 'SELL_PARTIAL', ticker: p.ticker, shares: Math.round((Number(p.shares) / 3) * 1e4) / 1e4, price: null, amount: null });
+    else if (v.action === 'ADD' && !sellsOnly) adds.push(p.ticker);
+  }
+  if (!trades.length && !adds.length) return { trades: [], reply: 'לא מצאתי המלצות פתוחות לביצוע. כתבו מה קניתם או מכרתם, למשל: מכרתי את כל AMD.', local: true };
+  const list = trades.map(t => `${t.type === 'SELL_ALL' ? 'מכירת כל' : 'מכירת שליש'} ${t.ticker}`).join(', ');
+  const addNote = adds.length ? ` להוספה (${adds.join(', ')}) כתבו כמה קניתם.` : '';
+  return { trades: trades.slice(0, 24), reply: (list ? `לפי ההמלצות: ${list}. בדקו ואשרו.` : '') + addNote, local: true };
+}
+
+return { TRADE_TYPES, TRADE_HE, recomputePortfolio, previewTrade, applyTrades, TRADE_PARSE_SCHEMA, recsForPrompt, tradeParsePrompt, cleanParsedTrades, parseTradeLocal, recsTradesLocal };
 })();
 var TRADE_TYPES = __trades.TRADE_TYPES;
 var TRADE_HE = __trades.TRADE_HE;
@@ -1887,6 +1910,7 @@ var recsForPrompt = __trades.recsForPrompt;
 var tradeParsePrompt = __trades.tradeParsePrompt;
 var cleanParsedTrades = __trades.cleanParsedTrades;
 var parseTradeLocal = __trades.parseTradeLocal;
+var recsTradesLocal = __trades.recsTradesLocal;
 
 /* ---------------- lib/analysts.js ---------------- */
 var __analysts = (function () {
