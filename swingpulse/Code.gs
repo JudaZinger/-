@@ -8,7 +8,7 @@
    Secrets live in Script Properties (only the owner can read them).
    =================================================================================== */
 
-var GAS_VERSION = '6.7.0';
+var GAS_VERSION = '6.8.0';
 var DEFAULT_MODEL = 'gemini-flash-latest';
 var FALLBACK_MODELS = ['gemini-flash-lite-latest', 'gemini-2.5-flash'];
 var CELL_MAX = 45000;                 // a Sheets cell holds 50,000 characters; keep a margin
@@ -295,13 +295,15 @@ function geminiGenerate_(request, opts) {
   if (!key) throw apiError_('gemini_no_key', 'חסר מפתח Gemini. הזינו אותו בהגדרות.');
   var main = secret_('GEMINI_MODEL') || DEFAULT_MODEL;
   var chain = [main].concat(FALLBACK_MODELS.filter(function (m) { return m !== main; })).slice(0, opts.light ? 2 : 3);
-  var tries = opts.light ? 1 : 3;
+  if (opts.fast) chain = ['gemini-flash-lite-latest'].concat(chain.filter(function (m) { return m !== 'gemini-flash-lite-latest'; })).slice(0, 2);
+  var tries = opts.light || opts.fast ? 1 : 3;
+  var minLeft = opts.fast ? 8e3 : 45e3;
   var deadline = opts.deadline || (Date.now() + 5 * 60e3);
   var last = null;
   for (var mi = 0; mi < chain.length; mi++) {
     var model = chain[mi];
     for (var attempt = 1; attempt <= tries; attempt++) {
-      if (deadline - Date.now() < 45e3) throw last || apiError_('timeout', 'נגמר הזמן לניתוח. נסו שוב.');
+      if (deadline - Date.now() < minLeft) throw last || apiError_('timeout', 'נגמר הזמן לניתוח. נסו שוב.');
       var r = fetchJSON_('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent', {
         method: 'post', contentType: 'application/json', headers: { 'x-goog-api-key': key }, payload: JSON.stringify(request)
       });
@@ -804,11 +806,16 @@ function applyBooks_(h, trades, source) {
 function parseTrade_(text, mode) {
   if (!String(text || '').trim()) throw apiError_('bad_request', 'ההודעה ריקה');
   var h = holderFor_(mode);
-  var r = geminiGenerate_({
-    contents: [{ role: 'user', parts: [{ text: tradeParsePrompt(text, bothBooksForPrompt(h.portfolio, h.portfolioIL), recsForPrompt(h.digest, bothBooksForPrompt(h.portfolio, h.portfolioIL))) }] }],
-    generationConfig: { responseMimeType: 'application/json', responseJsonSchema: TRADE_PARSE_SCHEMA }
-  }, { json: true });
-  var parsed = cleanParsedTrades(r.data);
+  var books = bothBooksForPrompt(h.portfolio, h.portfolioIL);
+  // simple sentences ("קניתי 2 NVDA ב-180") are parsed here in milliseconds; the AI only gets what this can't read
+  var parsed = parseTradeLocal(text, books), r = { model: 'local' };
+  if (!parsed) {
+    r = geminiGenerate_({
+      contents: [{ role: 'user', parts: [{ text: tradeParsePrompt(text, books, recsForPrompt(h.digest, books)) }] }],
+      generationConfig: { responseMimeType: 'application/json', responseJsonSchema: TRADE_PARSE_SCHEMA }
+    }, { json: true, fast: true, deadline: Date.now() + 35e3 });
+    parsed = cleanParsedTrades(r.data);
+  }
   var need = parsed.trades.filter(function (t) { return !(t.price > 0); }).map(function (t) { return t.ticker; });
   var quotes = need.length ? getQuotes_(need).quotes : {};
   parsed.trades.forEach(function (t) {
@@ -1781,7 +1788,94 @@ function cleanParsedTrades(d) {
   return { trades, reply: String((d && d.reply) || '').slice(0, 300) };
 }
 
-return { TRADE_TYPES, TRADE_HE, recomputePortfolio, previewTrade, applyTrades, TRADE_PARSE_SCHEMA, recsForPrompt, tradeParsePrompt, cleanParsedTrades };
+/* ---------- fast local parser: common Hebrew trade sentences, no AI ---------- */
+// US names people write in Hebrew. Held positions are matched first by symbol or company name.
+const US_HE = {
+  'אנבידיה': 'NVDA', 'נבידיה': 'NVDA', 'אינבידיה': 'NVDA', 'אפל': 'AAPL', 'גוגל': 'GOOGL', 'אלפבית': 'GOOGL', 'מיקרוסופט': 'MSFT', 'מייקרוסופט': 'MSFT',
+  'אמזון': 'AMZN', 'טסלה': 'TSLA', 'מטא': 'META', 'פייסבוק': 'META', 'נטפליקס': 'NFLX', 'פלנטיר': 'PLTR', 'פלאנטיר': 'PLTR', 'אינטל': 'INTC',
+  'אורקל': 'ORCL', 'ברודקום': 'AVGO', 'מרוול': 'MRVL', 'אדובי': 'ADBE', 'סיילספורס': 'CRM', 'קוואלקום': 'QCOM', 'מיקרון': 'MU', 'דל': 'DELL',
+  'אקסון': 'XOM', 'שברון': 'CVX', 'קוקה קולה': 'KO', 'פייזר': 'PFE', 'דיסני': 'DIS', 'ויזה': 'V', 'מאסטרקארד': 'MA', 'אובר': 'UBER', 'סולאראדג': 'SEDG',
+};
+const BUY_RE = /^(?:קניתי|קנינו|קנה|הוספתי|נכנסתי(?:\s+ל)?|רכשתי|bought|buy)$/i;
+const SELL_RE = /^(?:מכרתי|מכרנו|מכר|יצאתי(?:\s+מ)?|מימשתי|סגרתי|sold|sell)$/i;
+const VERB_SPLIT = /(?:^|\s|,|ו)(?=(?:קניתי|קנינו|הוספתי|נכנסתי|רכשתי|מכרתי|מכרנו|יצאתי|מימשתי|סגרתי)(?:\s|$))/;
+
+function numHe(s) {
+  const t = String(s).replace(/,/g, '');
+  if (/^\d+(?:\.\d+)?$/.test(t)) return Number(t);
+  return { 'אחת': 1, 'אחד': 1, 'שתיים': 2, 'שתי': 2, 'שניים': 2, 'שני': 2, 'שלוש': 3, 'שלושה': 3, 'ארבע': 4, 'ארבעה': 4, 'חמש': 5, 'חמישה': 5, 'עשר': 10, 'עשרה': 10 }[t] ?? null;
+}
+
+/** Find the stock a clause talks about: held symbol, held company name, Latin ticker, Hebrew name. */
+function findTicker(clause, held) {
+  const words = clause.replace(/[.,!?״"']/g, ' ').split(/\s+/).filter(Boolean);
+  const strip = w => w.replace(/^(?:ו|ב|ל|מ|ה|ש)(?=[א-ת]{2})/, '');
+  for (const p of held) {                                               // held symbol (with or without .TA)
+    const sym = String(p.ticker).toUpperCase(), base = sym.replace(/\.TA$/, '');
+    if (words.some(w => [sym, base].includes(w.toUpperCase().replace(/^[מבל]-?/, '')))) return sym;
+  }
+  const GENERIC = /^(?:בנק|קבוצה|קבוצת|מערכות|תעשיות|החזקות|השקעות|בע"?מ|מ"ר|inc|corp|ltd|holdings|group|technologies|technology|the)$/i;
+  for (const p of held) {                                               // held company name, Hebrew or English: any distinctive word
+    const parts = String(p.companyName || '').replace(/[.,()"״]/g, ' ').split(/\s+/).filter(x => x.length >= 3 && !GENERIC.test(x));
+    if (parts.some(x => words.some(w => strip(w) === x || w.toLowerCase() === x.toLowerCase()))) return String(p.ticker).toUpperCase();
+  }
+  const heldSym = new Set(held.map(p => String(p.ticker).toUpperCase()));
+  const TWINS = { GOOGL: 'GOOG', GOOG: 'GOOGL', BRK: 'BRK.B' };
+  for (const w of words) {
+    const t = US_HE[strip(w)];
+    if (t) return !heldSym.has(t) && heldSym.has(TWINS[t]) ? TWINS[t] : t;   // "גוגל" → the Google class they hold
+  }
+  for (const w of words) { const m = w.match(/^[מבל]?-?([A-Za-z]{1,5}(?:\.TA)?)$/); if (m && /[A-Z]/.test(m[1])) return m[1].toUpperCase(); }
+  return null;
+}
+
+/**
+ * Parse "קניתי 2 NVDA ב-180", "מכרתי את כל AMD", "מכרתי חצי מאפל", "קניתי ב-500 דולר גוגל", several clauses joined by "ו".
+ * Returns { trades, reply } when every clause is understood, else null (then the AI parses it).
+ */
+function parseTradeLocal(text, portfolio) {
+  const src = String(text || '').trim();
+  if (!src || src.length > 300) return null;
+  const held = (portfolio && portfolio.positions) || [];
+  const clauses = src.split(VERB_SPLIT).map(s => s.replace(/^\s*(?:,|וגם|ו)\s*/, '').trim()).filter(Boolean);
+  if (!clauses.length || clauses.length > 6) return null;
+  const trades = [];
+  for (const c of clauses) {
+    const verb = c.split(/\s+/)[0];
+    const buy = BUY_RE.test(verb), sell = SELL_RE.test(verb);
+    if (!buy && !sell) return null;
+    const ticker = findTicker(c.slice(verb.length), held);
+    if (!ticker) return null;
+    const hasHe = /[א-ת]/.test(ticker);
+    if (hasHe) return null;
+    const rest = c.slice(verb.length);
+    const priceM = rest.match(/(?:\sב-?\s?|במחיר\s|@\s?|בשער\s)(\d+(?:[.,]\d+)?)(?![\d.,])(?!\s*(?:\$|דולר|ש"?ח|שקל|₪|מניות|מניה|יח))/);
+    const amountM = rest.match(/(?:ב-?\s?)?(\d[\d,]*(?:\.\d+)?)\s*(?:\$|דולר|ש"?ח|שקלים|שקל|₪)|(?:\$|₪)\s?(\d[\d,]*(?:\.\d+)?)/);
+    const price = priceM ? Number(priceM[1].replace(',', '.')) : null;
+    const amount = amountM ? Number(String(amountM[1] || amountM[2]).replace(/,/g, '')) : null;
+    const pos = held.find(p => String(p.ticker).toUpperCase() === ticker);
+    let type = buy ? 'BUY' : 'SELL_PARTIAL', shares = null;
+    if (sell && (/את\s+כל|(?:^|\s)(?:הכל|הכול)(?:\s|$)|כל\s+ה(?:מניות|פוזיציה|אחזקה)|את\s+כולן/.test(rest) || /^יצאתי|^סגרתי/.test(verb))) type = 'SELL_ALL';
+    const half = rest.match(/(חצי|רבע)\s+מני(?:ה|ות)/);              // "חצי מניה" = half a share, not half the position
+    if (half) shares = half[1] === 'חצי' ? 0.5 : 0.25;
+    const frac = !half && rest.match(/חצי|שליש|רבע/);
+    if (sell && frac && pos) { type = 'SELL_PARTIAL'; shares = Math.floor(Number(pos.shares) / { 'חצי': 2, 'שליש': 3, 'רבע': 4 }[frac[0]] * 10000) / 10000; }
+    if (shares == null && type !== 'SELL_ALL') {
+      const clean = rest.replace(priceM ? priceM[0] : '§', ' ').replace(amountM ? amountM[0] : '§', ' ');
+      const qm = clean.match(/(?:^|\s)(\d+(?:\.\d+)?|אחת|אחד|שתיים|שתי|שניים|שני|שלוש|שלושה|ארבע|ארבעה|חמש|חמישה|עשר|עשרה)(?=\s|$)/);
+      shares = qm ? numHe(qm[1]) : null;
+      if (shares == null && amount == null) return null;                   // "קניתי אנבידיה" with no amount: let the AI ask
+    }
+    if (type === 'SELL_ALL' && !pos) return null;
+    trades.push({ type, ticker, shares: type === 'SELL_ALL' ? null : shares, price, amount: shares == null ? amount : null });
+  }
+  if (!trades.length) return null;
+  const he = { BUY: 'קנייה', SELL_PARTIAL: 'מכירה', SELL_ALL: 'מכירת הכל' };
+  const reply = 'הבנתי: ' + trades.map(t => `${he[t.type]} ${t.shares != null ? t.shares + ' ' : t.amount != null ? t.amount + ' ב-' : ''}${t.ticker}${t.price ? ' ב-' + t.price : ''}`).join(', ') + '.';
+  return { trades, reply, local: true };
+}
+
+return { TRADE_TYPES, TRADE_HE, recomputePortfolio, previewTrade, applyTrades, TRADE_PARSE_SCHEMA, recsForPrompt, tradeParsePrompt, cleanParsedTrades, parseTradeLocal };
 })();
 var TRADE_TYPES = __trades.TRADE_TYPES;
 var TRADE_HE = __trades.TRADE_HE;
@@ -1792,6 +1886,7 @@ var TRADE_PARSE_SCHEMA = __trades.TRADE_PARSE_SCHEMA;
 var recsForPrompt = __trades.recsForPrompt;
 var tradeParsePrompt = __trades.tradeParsePrompt;
 var cleanParsedTrades = __trades.cleanParsedTrades;
+var parseTradeLocal = __trades.parseTradeLocal;
 
 /* ---------------- lib/analysts.js ---------------- */
 var __analysts = (function () {

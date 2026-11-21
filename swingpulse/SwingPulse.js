@@ -280,7 +280,7 @@ function combineBooks(us, il, rate, display = "ILS") {
 // SwingPulse.jsx
 import { Component, createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-var APP_VERSION = "6.7.3";
+var APP_VERSION = "6.8.0";
 var APP_ENGINE = "Gemini Core";
 function resolveApiBase() {
   if (typeof window === "undefined" || !window.location) return "http://localhost:5001";
@@ -3730,7 +3730,11 @@ var demoApi = {
   get: () => rpc("getDemo"),
   reset: () => rpc("demoReset"),
   put: (patch) => rpc("putDemo", patch),
-  parse: async (text, mode) => rpc("parseTrade", text, requireMode(mode)),
+  // never an endless spinner: the server answers simple sentences at once, the AI gets 45s
+  parse: async (text, mode) => Promise.race([
+    rpc("parseTrade", text, requireMode(mode)),
+    new Promise((_, no) => setTimeout(() => no(Object.assign(new Error("timeout"), { code: "timeout" })), 45e3))
+  ]),
   apply: async (trades, mode, source) => rpc("applyTrades", trades, requireMode(mode), source),
   analysts: (ticker, mode, refresh = false) => rpc("analysts", ticker, mode, refresh),
   place: async (order, mode) => rpc("placeOrder", order, requireMode(mode)),
@@ -4335,7 +4339,8 @@ function CommandBar({ mode, enabled, onApplied, shown = false, onDismiss }) {
       setResult({ ...r, mode: sent });
       setPhase("review");
     } catch (x) {
-      setError(x.code === "gemini_no_key" ? "חסר מפתח Gemini בהגדרות." : x.message || "לא הצלחתי להבין");
+      const busy = x.code === "timeout" || x.code === "gemini_busy" || /quota|429|RESOURCE_EXHAUSTED/i.test(x.message || "");
+      setError(x.code === "gemini_no_key" ? "חסר מפתח Gemini בהגדרות." : busy ? "ה-AI עמוס כרגע. כתבו בפשטות, למשל: קניתי 2 NVDA ב-180, או מכרתי את כל AMD" : x.message || "לא הצלחתי להבין");
       setPhase("idle");
     }
   }
